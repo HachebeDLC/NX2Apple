@@ -1698,6 +1698,16 @@ enum { ALIAS_IDLE = 16 };
 static uint64_t g_alias_taken;   // shared textures evicted when another texture took over their storage (for the memory report)
 static nvn_hmap g_ghost;   // defined below (finalized texture serials)
 static int serial_holds(nvn_hmap *m, id o) { for (uint32_t i = 0; i < m->cap; i++) if (m->vals[i] == (__bridge void *)o) return 1; return 0; }
+// Whether another shared entry is a level view of this texture (alias_level_view): the view holds no residency of its own (it is no allocation), so the texture stays shared and
+// resident while a view of it is. Evicting it removed it from the residency set while a later serial still sampled it through the view: a GPU address fault on an iPhone
+// (Storm Connections' character select, which keeps rebuilding textures over the same storage). Caller holds g_smu
+static int alias_has_view_of(id o) {
+    for (uint32_t i = 0; i < g_alias.cap; i++) {
+        id v = (__bridge id)g_alias.vals[i];
+        if (v && v != o && [v conformsToProtocol:@protocol(MTLTexture)] && ((id<MTLTexture>)v).parentTexture == o) return 1;
+    }
+    return 0;
+}
 static void alias_take_over(const alias_key *nk) {
     nvn_texlayout L; nvn_tex_layout(&nk->d, &L);
     if (!L.size) return;
@@ -1709,7 +1719,7 @@ static void alias_take_over(const alias_key *nk) {
         if (k.pool != nk->pool || !memcmp(&k, nk, sizeof k) || k.off >= hi) continue;
         nvn_texlayout kl; nvn_tex_layout(&k.d, &kl);
         uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, &k);
-        if (k.off + (int64_t)kl.size <= lo || (seen && g_fence + 1 - seen < ALIAS_IDLE) || serial_holds(&g_by_serial, (__bridge id)g_alias.vals[i])) continue;
+        if (k.off + (int64_t)kl.size <= lo || (seen && g_fence + 1 - seen < ALIAS_IDLE) || serial_holds(&g_by_serial, (__bridge id)g_alias.vals[i]) || alias_has_view_of((__bridge id)g_alias.vals[i])) continue;
         ks[n++] = k;
     }
     for (uint32_t j = 0; j < n; j++) {
@@ -1723,6 +1733,23 @@ static void alias_take_over(const alias_key *nk) {
     if (n) { g_ser_gen++; g_alias_taken += n; }
 }
 static __unsafe_unretained id serial_get(uint64_t k) { pthread_mutex_lock(&g_smu); __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); pthread_mutex_unlock(&g_smu); return o; }
+// A texture over the storage of a shared one with the same description but fewer mip levels is a view of its first levels: Storm Connections builds its title backdrop textures
+// (BC1 2048x1024) with 6 levels, fills them by GPU copy, then builds a 5-level object over the same storage and samples that one (a separate Metal texture stayed empty: a black sky).
+// Caller holds g_smu
+static id<MTLTexture> alias_level_view(const alias_key *nk) {
+    for (uint32_t i = 0; i < g_alias.cap; i++) {
+        if (!g_alias.vals[i]) continue;
+        alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+        if (k.pool != nk->pool || k.off != nk->off || k.d.levels <= nk->d.levels || !nk->d.levels) continue;
+        nvn_texdesc a = k.d; a.levels = nk->d.levels;
+        if (memcmp(&a, &nk->d, sizeof a)) continue;
+        id<MTLTexture> base = (__bridge id<MTLTexture>)g_alias.vals[i];
+        NSUInteger sl = base.textureType == MTLTextureTypeCube ? 6 : base.textureType == MTLTextureTypeCubeArray ? base.arrayLength * 6 : base.textureType == MTLTextureType3D ? 1 : base.arrayLength;
+        if (nk->d.levels > base.mipmapLevelCount) return nil;
+        return [base newTextureViewWithPixelFormat:base.pixelFormat textureType:base.textureType levels:NSMakeRange(0, nk->d.levels) slices:NSMakeRange(0, sl)];
+    }
+    return nil;
+}
 static void serial_put(uint64_t k, id o) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { if (alias_has(old)) defer_obj_unref(old); else defer_obj_release(old); } hm_put_id(&g_by_serial, &k, o); g_ser_gen++; pthread_mutex_unlock(&g_smu); }
 static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { if (alias_has(old)) defer_obj_unref(old); else defer_obj_release(old); hm_del_id(&g_by_serial, &k); g_ser_gen++; } pthread_mutex_unlock(&g_smu); }   // nothing to drop: the texture ID caches stay valid
 // Texture serials owned by a live NVN texture object (TextureInitialize until Finalize or re-initialization, hle_nvn.c). Command records and texture pool registrations snapshot the
@@ -2647,9 +2674,19 @@ static id<MTLTexture> image_texture(const tex_t *t, MTLTextureDescriptor *d) {
     }
     return mt;
 }
+// NVN textures built over a GL texture name (nvnTextureBuilderSetGLTextureName, NVN-GL interop): serial → GL name. They resolve to the GL layer's own MTLTexture
+// (hle_gl.m dm_gl_tex_mtl), made on demand and remade when the game redefines it. NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS: Scaleform draws the UI with GLES 3.0
+// into GL textures that the game's NVN renderer samples
+static nvn_hmap g_gltex = {.klen = sizeof(uint64_t)};
+__attribute__((weak)) void *dm_gl_tex_mtl(uint32_t name) { (void)name; return NULL; }
+void mtl_tex_gl(uint64_t serial, uint32_t name) { pthread_mutex_lock(&g_smu); if (name) nvn_hm_put(&g_gltex, &serial, (void *)(uintptr_t)name); else nvn_hm_del(&g_gltex, &serial); pthread_mutex_unlock(&g_smu); }
 static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     tex_t *t = (tex_t *)ct;
     if (!t || !t->serial) return nil;
+    if (g_gltex.n) {
+        pthread_mutex_lock(&g_smu); uint32_t gn = (uint32_t)(uintptr_t)nvn_hm_get(&g_gltex, &t->serial); pthread_mutex_unlock(&g_smu);
+        if (gn) { id<MTLTexture> m = (__bridge id<MTLTexture>)dm_gl_tex_mtl(gn); res_add(m); return m; }
+    }
     if (t->magic != MAGIC('T', 'E', 'X', 0)) { RED_ONCE(70, "texture object no longer valid (magic %#x, first case ser=%llu): no MTLTexture created", t->magic, (unsigned long long)t->serial); return nil; }
     int packaged = tex_from_storage(t);
     {   // Diagnostic DM_NVN_TEXINFO=WxH: log storage and description of textures of that size on first resolution (to tell whether two textures share storage and why they were not merged)
@@ -2744,6 +2781,11 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     ak.d.flags &= ~NVN_TEXTURE_FLAGS_IMAGE;
     pthread_mutex_lock(&g_smu); __unsafe_unretained id shared = hm_get_id(&g_alias, &ak); if (shared) nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1)); pthread_mutex_unlock(&g_smu);
     if (shared) { tex_put(t->serial, shared); return shared; }
+    pthread_mutex_lock(&g_smu);
+    id<MTLTexture> lv = g_alias_set ? alias_level_view(&ak) : nil;
+    if (lv) { hm_put_id(&g_alias, &ak, lv); CFSetAddValue(g_alias_set, (__bridge const void *)lv); nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1)); }
+    pthread_mutex_unlock(&g_smu);
+    if (lv) { static int n; if (n++ < 5) MLOG("texture ser=%llu %ux%u format %#x: a view of the first %u levels of the texture already on its storage", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels); tex_put(t->serial, lv); return lv; }
     id<MTLTexture> mt = tex_linear(t);
     if (!mt) {
         MTLTextureDescriptor *d = tex_desc(t, 0);
@@ -10247,6 +10289,39 @@ static void draw_tex(const p_draw_tex *c) {
     }
     args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
 }
+// The BC texture sharing storage with t, when t is its raw-block view as a texture of its own: same pool and offset, one t texel per 4x4 block of the same bytes. DRAGON BALL Sparking! ZERO's
+// runtime virtual texture compresses each 136x136 page into a 34x34 RGBA32UI texture and copies it into a 1122x1122 RGBA32UI texture object initialized over its 4488x4488 BC3 physical texture;
+// with separate host textures the BC3 one the landscape samples stayed empty and the ground drew black
+static id<MTLTexture> bc_sibling(const tex_t *t) {
+    int bw, bh, bpb = t->pool && t->d.target == NVN_TEXTURE_TARGET_2D ? nvn_fmt_bpb(t->d.format, &bw, &bh) : 0;
+    if ((bpb != 8 && bpb != 16) || bw != 1 || bh != 1 || nvn_fmt_bc(t->d.format)) return nil;
+    __unsafe_unretained id r = nil;
+    pthread_mutex_lock(&g_smu);
+    for (uint32_t i = 0; i < g_alias.cap && !r; i++) {
+        if (!g_alias.vals[i]) continue;
+        alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+        int kw, kh;
+        if (k.pool != (uint64_t)(uintptr_t)t->pool || k.off != t->off || !nvn_fmt_bc(k.d.format) || k.d.target != NVN_TEXTURE_TARGET_2D || nvn_fmt_bpb(k.d.format, &kw, &kh) != bpb) continue;
+        if ((k.d.width + kw - 1) / kw == t->d.width && (k.d.height + kh - 1) / kh == t->d.height) r = (__bridge id)g_alias.vals[i];
+    }
+    pthread_mutex_unlock(&g_smu);
+    return r;
+}
+// A copy into such a raw-block texture also lands in its BC sibling: source texels → arena buffer → blocks of the BC texture (Metal copies between those formats only through a buffer)
+static void bc_sibling_copy(const p_copy_t2t *c, id<MTLTexture> s, unsigned sl, unsigned sz0, unsigned dl, unsigned dz0) {
+    id<MTLTexture> bc = bc_sibling(c->dst);
+    if (!bc || c->flags || (c->sr.depth ? c->sr.depth : 1) != 1 || c->sr.width != c->dr.width || c->sr.height != c->dr.height || s.textureType != MTLTextureType2D) return;
+    int bpb = bc_block_bytes(bc.pixelFormat); NSUInteger lw = mip_extent(bc.width, dl), lh = mip_extent(bc.height, dl);
+    if (!bpb || dl >= bc.mipmapLevelCount || dz0 + c->dr.zoffset >= bc.arrayLength || (NSUInteger)c->dr.xoffset * 4 >= lw || (NSUInteger)c->dr.yoffset * 4 >= lh) return;
+    NSUInteger w = c->sr.width, h = c->sr.height, row = w * bpb, img = row * h;
+    id<MTLBuffer> pb; size_t po = arena_alloc(img, &pb);
+    if (!pb) return;
+    enc_b_copy_texture_buffer(blit(), s, sz0 + c->sr.zoffset, sl, MTLOriginMake(c->sr.xoffset, c->sr.yoffset, 0), MTLSizeMake(w, h, 1), pb, po, row, img);
+    enc_b_copy_buffer_texture(blit(), pb, po, row, img, MTLSizeMake(MIN(w * 4, lw - c->dr.xoffset * 4), MIN(h * 4, lh - c->dr.yoffset * 4), 1), bc, dz0 + c->dr.zoffset, dl,
+                              MTLOriginMake(c->dr.xoffset * 4, c->dr.yoffset * 4, 0));
+    static int once; if (!once++) MLOG("texture copy into the raw blocks of a BC texture: %lux%lu blocks also copied into its %lux%lu BC texture (Metal format %lu, first case dst ser=%llu)",
+                                       (unsigned long)w, (unsigned long)h, (unsigned long)bc.width, (unsigned long)bc.height, (unsigned long)bc.pixelFormat, (unsigned long long)c->dst->serial);
+}
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
 static void copy_t2t(const p_copy_t2t *c) {
     if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "texture copy source");
@@ -10294,6 +10369,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     }
     PD("t src=%llu lv%u sl%u xyz=%d,%d,%d dst=%llu lv%u sl%u xyz=%d,%d,%d size=%d,%d,%d", c->src->serial, sl, sz0, c->sr.xoffset, c->sr.yoffset, c->sr.zoffset,
        c->dst->serial, dl, dz0, c->dr.xoffset, c->dr.yoffset, c->dr.zoffset, c->sr.width, c->sr.height, c->sr.depth);
+    bc_sibling_copy(c, s, sl, sz0, dl, dz0);
     int s3 = c->src->d.target == 2, d3 = c->dst->d.target == 2, nz = c->sr.depth ? c->sr.depth : 1;
     // The copy's bytes belong in the destination's storage: written there now from the source's storage when that holds its content and the copy is a plain one (the same Metal format: a
     // format change is drawn below and converts the bytes), else read back after the copy (decided before the draw path gives the destination render-target use, which makes it GPU-owned from then on)

@@ -197,6 +197,8 @@ elif [ -n "$AOC" ] && [ -d "$AOC" ]; then
   t "add-on content alongside the game data (DM_FULL_ROMFS=1 packs it): $(ls "$AOC" | tr '\n' ' ')"
 fi
 if [ -n "${PSO:-}" ]; then MAPS+=("$P/pso=$PSO"); fi
+# an NVN game that also draws with GL (Storm Connections: its Scaleform UI is GLES 3.0) takes the GL library beside the NVN chain's, from gl_shaders.py on a DM_GL_CAPTURE folder
+if [ "$MSLDIR" != gl ] && [ -f "$MSL_IOS/gl/gl_shaders.metallib" ]; then MAPS+=("$P/msl/gl=$MSL_IOS/gl"); t "GL shader library: $MSL_IOS/gl"; fi
 MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP")
 t "pack IPA (already-compressed game files stored, everything else deflated)"
 # The pulling vertex libraries (<key>_bp, dm/gfx/tools/dmsh_pull.py) serve the hybrid pipelines. Default to the same pso_mtl4 setting compiled by gen_build.py; IOS_PULL=0 / 1 overrides it.

@@ -49,6 +49,8 @@ static const struct { const char *build, *what; int layout; uint64_t obj, vtable
     // SHIN MEGAMI TENSEI V: Vengeance 1.0.3: GCreateMalloc makes the object in x19; the constructor reserves 37 GB at main+0x15790b0. Its vtable has the UE4 layout:
     // TryMalloc / TryRealloc call +0x18 / +0x28, slots 17 and 18 return 1, 19 returns "Binned3"; the following word is 0 (no OnMallocInitialized).
     { "0a4f14a5c12f470a4d3168a8f2ae6005", "SHIN MEGAMI TENSEI V: Vengeance 1.0.3", UE4_27, 0, 0x5a7f0a8, 0x1f2f63c },
+    // DRAGON BALL Sparking! ZERO 2.0.73: made by GCreateMalloc like DRAGON QUEST VII's, its vtable (main+0x8646da8, 21 slots), the first of the two cut constructor calls (main+0x1dd0030, main+0x1dd0548)
+    { "7b53433fa04477fc8a540bd80d5ce665", "DRAGON BALL Sparking! ZERO 2.0.73", UE4_27, 0, 0x8646da8, 0x1dd0030 },
     // FINAL FANTASY RESONANCE 1.0.1: the FMallocBinned3 object (main+0x77c6210, bss), its vtable (main+0x67df800, 32 slots), the cut constructor call (main+0x137f0)
     { "84e182f72ee1da4f477804bd05b54c15", "FINAL FANTASY RESONANCE 1.0.1", UE5_6, 0x77c6210, 0x67df800, 0x137f0 },
     // Asian release: object, 32-slot vtable and constructor cut verified on this main build (PRs #126 and #304).

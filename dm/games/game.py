@@ -97,6 +97,12 @@ def header(g):
     if pi not in ('game', 'display'): sys.exit(f'{g.id}: present_interval must be game or display: {pi}')
     ft = g.get('fps_target', '0')   # frame rate cap of the rewriter's frame step (FRAME_STEP in the profile's patches.py: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0) or of the engine's own frame limit (hle_fpslock.c): 0 = the game's own step, 30 / 60
     if ft not in ('0', '30', '60'): sys.exit(f'{g.id}: fps_target must be 0, 30 or 60: {ft}')
+    sp = g.get('screen_percentage', '0')   # Unreal r.ScreenPercentage the host sets over the device profile's (hle_fpslock.c k_cvars; DRAGON BALL Sparking! ZERO): 0 = the game's own, else 25 to 200
+    try: spv = float(sp)
+    except ValueError: spv = -1
+    if not (spv == 0 or 25 <= spv <= 200): sys.exit(f'{g.id}: screen_percentage must be 0 or 25 to 200: {sp}')
+    dh = g.get('display_height', '0')   # the game's own output size picked from its display mode table (hle_fpslock.c k_res; NARUTO X BORUTO Storm Connections): 0 = the game's own, else 720 / 900 / 1080
+    if dh not in ('0', '720', '900', '1080'): sys.exit(f'{g.id}: display_height must be 0, 720, 900 or 1080: {dh}')
     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
     if fh not in ('on', 'off'): sys.exit(f'{g.id}: fps_hold must be on or off: {fh}')
     utp = g.get('ue_texture_pool', '0')   # Unreal's r.Streaming.PoolSize in MB, raised to this on the Mac (hle_uecvar.c; DM_UE_TEXTURE_POOL overrides, and turns it on for iOS): 0 = the game's own pool
@@ -174,6 +180,8 @@ def header(g):
          f'#define DM_GAME_PRESENT_SNAP {int(ps == "on")}',
          f'#define DM_GAME_PSO_MTL4 {int(p4 == "on")}',
          f'#define DM_GAME_ENC_THREAD {int(et == "on")}',
+         f'#define DM_GAME_SCREEN_PERCENTAGE {q(sp)}',
+         f'#define DM_GAME_DISPLAY_HEIGHT {int(dh)}',
          *([f'#define DM_GAME_SHARED_FONT_TTF {int(sf == "ttf")}'] if g.get('shared_font', '') else []),   # without the key the host decides by the SDK version (hle_sdk16.c)
          f'#define DM_GAME_PAD_LAYOUT {("simple", "full", "touch").index(pl)}',
          f'#define DM_GAME_OPMODE {int(om == "console")}',

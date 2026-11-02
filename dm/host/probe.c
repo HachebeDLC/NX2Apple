@@ -138,6 +138,7 @@ static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the
             int dr = (g_probe[i].dump >> 25) & 31;                                    // @xN+offset: based on xN
             uint64_t at = uc->uc_mcontext->__ss.__x[dr] + (g_probe[i].dump & 0xffffff);
             if (g_probe[i].dump & 0x1000000) { uint64_t p = 0; vm_size_t g = 0; if (!vm_read_overwrite(mach_task_self(), at, 8, (vm_address_t)&p, &g) && p) at = p + g_probe[i].dpost; else at = 0; }   // @*offset[+post]: dereference first, then dump (post bytes further on)
+            if (at && getenv("DM_PROBE_DUMPTXT")) { char t[97] = {0}; vm_size_t g2 = 0; if (!vm_read_overwrite(mach_task_self(), at, 96, (vm_address_t)t, &g2)) { for (int k = 0; k < 96; k++) if (t[k] && (t[k] < 32 || t[k] > 126)) t[k] = '.'; fprintf(stderr, " txt=\"%s\"", t); } }
             if (at && !vm_read_overwrite(mach_task_self(), at, 16, (vm_address_t)b, &got) && got == 16) {
                 fprintf(stderr, " [%sx%d+%#lx]", (g_probe[i].dump & 0x1000000) ? "*" : "", dr, g_probe[i].dump & 0xffffff);
                 if (g_probe[i].dpost) fprintf(stderr, "+%#lx", g_probe[i].dpost);
@@ -361,7 +362,167 @@ static void watch_install(void) {
 
 #endif
 
+#if !TARGET_OS_IPHONE   // DM_HEAPTRACK is a Mac diagnostic (it needs the probes above)
+// DM_HEAPTRACK=<module>:<a|f|r><offset hex>/<register>[/<old register>],… (diagnostic): live-pointer set of one allocator. 'a' = an allocation returned the pointer in the register,
+// 'f' = the pointer is being freed, 'r' = a reallocation returned the new pointer (the old one in the second register). An allocation of a pointer already live, or a free of one
+// that is not, is printed with a backtrace (a double free: two owners of one block). NARUTO X BORUTO STORM CONNECTIONS: Scaleform's heap free lists held another object's data
+typedef struct { uint64_t at; char kind; int reg, oreg; } ht_site;
+// DM_HEAPTRACK_POISON: entries 's<offset>/<size register>' record the requested size at an allocation function's entry (per thread, taken by the next 'a' on that thread);
+// a free then fills the block's inside [0x30, size − 0x10) with 0xF00DF00D and remembers where it came from; the crash report lists freed blocks whose fill changed (written after free)
+typedef struct { uint64_t p, size, lr[6]; uint8_t save[0x200]; } ht_freed;
+#define HT_NFREED 65536
+static ht_freed g_htf[HT_NFREED]; static uint64_t g_htf_n;
+static __thread uint64_t tl_ht_size;
+static uint64_t g_watch[256]; static int g_nwatch;
+static __thread uint64_t tl_ht_rp, tl_ht_rs;   // reallocation in progress on this thread: old pointer, new size
+#define HT_SCAP (1u << 22)
+static uint64_t *g_hts_k, *g_hts_v;   // live pointer → requested size
+static uint64_t (*g_hts_lr)[4];       // and the allocation's callers
+// Overlap check (DM_HEAPTRACK_POISON): every live block with its size in one array (index kept beside the size), so a new block that overlaps a live one is caught as it is handed out
+typedef struct { uint64_t p, size; } ht_live;
+static ht_live *g_hl; static uint64_t g_hl_n; static uint32_t *g_hl_idx;   // g_hl_idx[size-table slot] = index + 1
+static void hl_lr_print(const uint64_t *lr) { ht_freed f = {0}; memcpy(f.lr, lr, 32); void ht_print_lr(const ht_freed *); ht_print_lr(&f); }
+
+
+static ht_site g_hts[16]; static int g_nhts; static pthread_mutex_t g_ht_mu = PTHREAD_MUTEX_INITIALIZER;
+#define HT_CAP (1u << 22)
+static uint64_t *g_ht; static uint64_t g_ht_n, g_ht_bad;
+static uint64_t *ht_slot(uint64_t k) { uint64_t h = (k >> 4) * 0x9E3779B97F4A7C15ull; for (uint64_t i = h >> 42;; i = (i + 1) & (HT_CAP - 1)) if (g_ht[i] == k || !g_ht[i]) return &g_ht[i]; }
+static void ht_del(uint64_t k) {   // backward-shift deletion
+    uint64_t *s = ht_slot(k); if (!*s) return; uint64_t i = (uint64_t)(s - g_ht); *s = 0;
+    for (uint64_t j = (i + 1) & (HT_CAP - 1); g_ht[j]; j = (j + 1) & (HT_CAP - 1)) { uint64_t v = g_ht[j]; g_ht[j] = 0; *ht_slot(v) = v; }
+}
+static void ht_report(const char *what, uint64_t p, ucontext_t *uc) {
+    if (g_ht_bad++ >= 40) return;
+    extern uint64_t g_t0_ns; uint64_t now_ns(void); uint32_t thr_cur_handle(void);
+    fprintf(stderr, "[dm] HEAPTRACK %s %#llx [%.4fs] T=%x pc=%#llx lr=%#llx live=%llu\n", what, (unsigned long long)p, (now_ns() - g_t0_ns) / 1e9, thr_cur_handle(),
+            (unsigned long long)uc->uc_mcontext->__ss.__pc, (unsigned long long)uc->uc_mcontext->__ss.__lr, (unsigned long long)g_ht_n);
+    dm_backtrace(uc->uc_mcontext->__ss.__fp);
+}
+static uint64_t *hs_slot(uint64_t k) { uint64_t h = (k >> 4) * 0x9E3779B97F4A7C15ull; for (uint64_t i = h >> 42;; i = (i + 1) & (HT_SCAP - 1)) if (g_hts_k[i] == k || !g_hts_k[i]) return &g_hts_k[i]; }
+static int ht_poison(void) { static int on = -1; if (on < 0) on = getenv("DM_HEAPTRACK_POISON") != NULL; return on; }
+void ht_print_lr(const ht_freed *f) {
+    for (int j = 0; j < 6 && f->lr[j]; j++) { module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (f->lr[j] >= (uint64_t)g_mod[i].base && f->lr[j] < (uint64_t)g_mod[i].base + g_mod[i].size) m = &g_mod[i];
+        if (m) fprintf(stderr, " %s+%#llx", m->name, (unsigned long long)(f->lr[j] - (uint64_t)m->base)); else fprintf(stderr, " %#llx", (unsigned long long)f->lr[j]); }
+}
+void dm_heaptrack_which(const uint64_t *x, int n) {   // crash.c: the last free of the block each register points into
+    if (!ht_poison() || !g_hts_k) return;
+    for (int r = 0; r < n; r++) { uint64_t best = 0, bi = 0;   // a live block holding it: who allocated it
+        if (x[r] < 0x7000000000ull || x[r] >= 0x7200000000ull) continue;
+        for (uint64_t i = 0; i < HT_SCAP; i++) { uint64_t p = g_hts_k[i]; if (p && *ht_slot(p) && p <= x[r] && x[r] < p + g_hts_v[i] && p > best) { best = p; bi = i; } }
+        if (best) { fprintf(stderr, "[dm] HEAPTRACK x%d=%#llx is +%#llx in LIVE block %#llx size %#llx allocated from", r, (unsigned long long)x[r], (unsigned long long)(x[r] - best), (unsigned long long)best, (unsigned long long)g_hts_v[bi]);
+            ht_freed f = {0}; memcpy(f.lr, g_hts_lr[bi], 32); ht_print_lr(&f); fputc('\n', stderr); } }
+    uint64_t m = g_htf_n < HT_NFREED ? g_htf_n : HT_NFREED;
+    for (int r = 0; r < n; r++) for (uint64_t k = 0; k < m; k++) {
+        ht_freed *f = &g_htf[(g_htf_n - 1 - k) % HT_NFREED];
+        if (f->p && x[r] >= f->p && x[r] < f->p + f->size) { fprintf(stderr, "[dm] HEAPTRACK x%d=%#llx is +%#llx in block %#llx size %#llx freed from", r, (unsigned long long)x[r], (unsigned long long)(x[r] - f->p), (unsigned long long)f->p, (unsigned long long)f->size); ht_print_lr(f); fputc('\n', stderr);
+            uint64_t o = x[r] - f->p; if (o < sizeof f->save) { fprintf(stderr, "[dm]   before free at +%#llx:", (unsigned long long)o); for (uint64_t k = o; k < o + 0x40 && k + 8 <= sizeof f->save; k += 8) fprintf(stderr, " %016llx", (unsigned long long)*(uint64_t *)(f->save + k));
+                uint64_t sp = *(uint64_t *)(f->save + (o + 0x10 < sizeof f->save - 8 ? o + 0x10 : 0)) & ~3ull; char str[96] = {0}; vm_size_t g = 0;
+                if (sp > 0x1000 && !vm_read_overwrite(mach_task_self(), (vm_address_t)(sp + 0xc), sizeof str - 1, (vm_address_t)str, &g)) { for (int i = 0; i < 95; i++) if (str[i] && (str[i] < 32 || str[i] > 126)) str[i] = '.'; fprintf(stderr, " | [+0x10]→ \"%s\"", str); }
+                fputc('\n', stderr); }
+            break; }
+    }
+}
+void dm_heaptrack_rzscan(void) {
+    if (!getenv("DM_HEAPTRACK_REDZONE") || !g_hl) return; int shown = 0;
+    for (uint64_t i = 0; i < g_hl_n && shown < 10; i++) { const uint8_t *c = (const uint8_t *)(g_hl[i].p + g_hl[i].size); int bad = -1; vm_size_t g = 0; uint8_t cc[64];
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)c, 64, (vm_address_t)cc, &g)) continue; for (int j = 0; j < 64; j++) if (cc[j] != 0xCB) { bad = j; break; }
+        if (bad >= 0) { uint64_t *k = hs_slot(g_hl[i].p); shown++; fprintf(stderr, "[dm] HEAPTRACK live block %#llx size %#llx overflowed at +%d:", (unsigned long long)g_hl[i].p, (unsigned long long)g_hl[i].size, bad);
+            for (int j = 0; j < 32; j++) fprintf(stderr, " %02x", cc[j]); fprintf(stderr, "; allocated from"); if (*k) hl_lr_print(g_hts_lr[k - g_hts_k]); fputc('\n', stderr); } }
+    fprintf(stderr, "[dm] HEAPTRACK redzone scan: %llu live blocks, %d overflowed\n", (unsigned long long)g_hl_n, shown);
+}
+void dm_heaptrack_scan(void) {   // crash.c: freed blocks whose fill changed
+    if (!ht_poison() || !g_hts_k) return; int shown = 0;
+    uint64_t n = g_htf_n < HT_NFREED ? g_htf_n : HT_NFREED;
+    for (uint64_t k = 0; k < n && shown < 12; k++) {
+        ht_freed *f = &g_htf[(g_htf_n - 1 - k) % HT_NFREED]; if (!f->p) continue;
+        for (uint64_t o = 0x30; o + 0x10 + 8 <= f->size; o += 8) {
+            uint64_t v = *(uint64_t *)(f->p + o);
+            if (v != 0xF00DF00DF00DF00Dull) {
+                // still free? (allocated again, its fill legitimately changed: then it is live in the set)
+                if (*ht_slot(f->p)) break;
+                fprintf(stderr, "[dm] HEAPTRACK freed block %#llx size %#llx written at +%#llx: %016llx %016llx %016llx %016llx; freed from", (unsigned long long)f->p, (unsigned long long)f->size, (unsigned long long)o,
+                        (unsigned long long)v, (unsigned long long)((uint64_t *)(f->p + o))[1], (unsigned long long)((uint64_t *)(f->p + o))[2], (unsigned long long)((uint64_t *)(f->p + o))[3]);
+                for (int j = 0; j < 6 && f->lr[j]; j++) { module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (f->lr[j] >= (uint64_t)g_mod[i].base && f->lr[j] < (uint64_t)g_mod[i].base + g_mod[i].size) m = &g_mod[i];
+                    if (m) fprintf(stderr, " %s+%#llx", m->name, (unsigned long long)(f->lr[j] - (uint64_t)m->base)); else fprintf(stderr, " %#llx", (unsigned long long)f->lr[j]); }
+                fputc('\n', stderr); shown++; break;
+            }
+        }
+    }
+    fprintf(stderr, "[dm] HEAPTRACK scan: %llu frees recorded, %d written after free\n", (unsigned long long)g_htf_n, shown);
+}
+static void ht_hit(ucontext_t *uc) {
+    uint64_t pc = uc->uc_mcontext->__ss.__pc; ht_site *s = NULL; for (int i = 0; i < g_nhts; i++) if (g_hts[i].at == pc) s = &g_hts[i];
+    if (!s) return;
+    uint64_t v = uc->uc_mcontext->__ss.__x[s->reg];
+    pthread_mutex_lock(&g_ht_mu);
+    if (s->kind == 'r' && uc->uc_mcontext->__ss.__x[s->oreg]) { uint64_t o = uc->uc_mcontext->__ss.__x[s->oreg]; if (!*ht_slot(o)) ht_report("realloc of a pointer not live", o, uc); else { ht_del(o); g_ht_n--; } }
+    // 'w': remember the pointer in the register; a later free of it (or of the block holding it, when sizes are known) is printed with a backtrace
+    if (s->kind == 'w') { if (g_nwatch < 256) g_watch[g_nwatch++] = v; pthread_mutex_unlock(&g_ht_mu); return; }
+    static int rz = -1; if (rz < 0) rz = getenv("DM_HEAPTRACK_REDZONE") != NULL;
+    if (s->kind == 's') { tl_ht_size = v; if (rz && v) uc->uc_mcontext->__ss.__x[s->reg] = v + 64; pthread_mutex_unlock(&g_ht_mu); return; }
+    // 'P' at a reallocation's entry (old pointer in the site's register, new size in its second one), 'Q' at its return: a block resized in place gets its new size
+    if (s->kind == 'P') { tl_ht_rp = v; tl_ht_rs = uc->uc_mcontext->__ss.__x[s->oreg]; if (rz && tl_ht_rs) uc->uc_mcontext->__ss.__x[s->oreg] = tl_ht_rs + 64; pthread_mutex_unlock(&g_ht_mu); return; }
+    if (s->kind == 'Q') { if (v && rz && tl_ht_rs) memset((void *)(v + tl_ht_rs), 0xCB, 64); if (v && v == tl_ht_rp && g_hts_k) { uint64_t *k = hs_slot(v); if (*k) { g_hts_v[k - g_hts_k] = tl_ht_rs; uint32_t ix = g_hl_idx ? g_hl_idx[k - g_hts_k] : 0; if (ix && ix <= g_hl_n) g_hl[ix - 1].size = tl_ht_rs; } }
+                          tl_ht_rp = 0; pthread_mutex_unlock(&g_ht_mu); return; }
+    if ((s->kind == 'a' || s->kind == 'r') && v) { uint64_t *sl = ht_slot(v); if (*sl) ht_report("allocation of a live pointer", v, uc); else { *sl = v; g_ht_n++; }
+        if (g_hts_k && tl_ht_size && g_hl) {   // overlap with a live block?
+            uint64_t e = v + tl_ht_size; int shown = 0;
+            for (uint64_t i = 0; i < g_hl_n && shown < 2; i++) if (g_hl[i].p < e && v < g_hl[i].p + g_hl[i].size && g_ht_bad < 40) {
+                uint64_t *ok = hs_slot(g_hl[i].p); shown++; g_ht_bad++;
+                fprintf(stderr, "[dm] HEAPTRACK OVERLAP new %#llx+%#llx with live %#llx+%#llx; live one allocated from", (unsigned long long)v, (unsigned long long)tl_ht_size, (unsigned long long)g_hl[i].p, (unsigned long long)g_hl[i].size);
+                if (*ok) hl_lr_print(g_hts_lr[ok - g_hts_k]); fprintf(stderr, "; new one from"); dm_backtrace(uc->uc_mcontext->__ss.__fp); }
+        }
+        if (rz && tl_ht_size) memset((void *)(v + tl_ht_size), 0xCB, 64);
+        if (g_hts_k && tl_ht_size) { uint64_t *k = hs_slot(v); *k = v; g_hts_v[k - g_hts_k] = tl_ht_size;
+            if (g_hl) { g_hl[g_hl_n] = (ht_live){v, tl_ht_size}; g_hl_idx[k - g_hts_k] = (uint32_t)++g_hl_n; }
+            uint64_t *lr = g_hts_lr[k - g_hts_k]; memset(lr, 0, 32); uint64_t *fp = (uint64_t *)uc->uc_mcontext->__ss.__fp; lr[0] = uc->uc_mcontext->__ss.__lr;
+            for (int j = 1; j < 4 && fp && ((uint64_t)fp & 7) == 0 && (uint64_t)fp > 0x1000; j++) { vm_size_t g = 0; uint64_t fr[2]; if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, 16, (vm_address_t)fr, &g) || g != 16) break; lr[j] = fr[1]; fp = (uint64_t *)fr[0]; } }
+        tl_ht_size = 0; }
+    if (s->kind == 'f' && v) for (int i = 0; i < g_nwatch; i++) {
+        uint64_t sz = 0; if (g_hts_k) { uint64_t *k = hs_slot(v); if (*k) sz = g_hts_v[k - g_hts_k]; }
+        if (g_watch[i] == v || (sz && g_watch[i] > v && g_watch[i] < v + sz)) { fprintf(stderr, "[dm] HEAPTRACK watched %#llx freed (block %#llx size %#llx)", (unsigned long long)g_watch[i], (unsigned long long)v, (unsigned long long)sz); dm_backtrace(uc->uc_mcontext->__ss.__fp); g_watch[i] = 0; }
+    }
+    if (s->kind == 'f' && v && rz && g_hts_k) { uint64_t *k = hs_slot(v); uint64_t sz = *k ? g_hts_v[k - g_hts_k] : 0;
+        if (sz) { const uint8_t *c = (const uint8_t *)(v + sz); int bad = -1; for (int i = 0; i < 64; i++) if (c[i] != 0xCB) { bad = i; break; }
+            if (bad >= 0 && g_ht_bad++ < 40) { fprintf(stderr, "[dm] HEAPTRACK OVERFLOW block %#llx size %#llx written %d bytes past its end:", (unsigned long long)v, (unsigned long long)sz, bad);
+                for (int i = 0; i < 32; i++) fprintf(stderr, " %02x", c[i]); fprintf(stderr, "; allocated from"); hl_lr_print(g_hts_lr[k - g_hts_k]); fprintf(stderr, "; freed from"); dm_backtrace(uc->uc_mcontext->__ss.__fp); } } }
+    if (s->kind == 'f' && v) { if (!*ht_slot(v)) ht_report("free of a pointer not live", v, uc); else { ht_del(v); g_ht_n--; }
+        if (ht_poison() && g_hts_k && g_hl) { uint64_t *k = hs_slot(v); uint32_t ix = *k ? g_hl_idx[k - g_hts_k] : 0;
+            if (ix && ix <= g_hl_n && g_hl[ix - 1].p == v) { g_hl[ix - 1] = g_hl[--g_hl_n]; if (ix - 1 < g_hl_n) { uint64_t *m = hs_slot(g_hl[ix - 1].p); if (*m) g_hl_idx[m - g_hts_k] = ix; } g_hl_idx[k - g_hts_k] = 0; } }
+        if (ht_poison() && g_hts_k) { uint64_t *k = hs_slot(v); uint64_t sz = *k ? g_hts_v[k - g_hts_k] : 0;
+            if (sz >= 0x60) { ht_freed *f = &g_htf[g_htf_n++ % HT_NFREED]; memcpy(f->save, (void *)v, sz < sizeof f->save ? sz : sizeof f->save);
+                for (uint64_t o = 0x30; o + 0x10 + 8 <= sz; o += 8) *(uint64_t *)(v + o) = 0xF00DF00DF00DF00Dull;
+                f->p = v; f->size = sz; memset(f->lr, 0, sizeof f->lr);
+                uint64_t *fp = (uint64_t *)uc->uc_mcontext->__ss.__fp; f->lr[0] = uc->uc_mcontext->__ss.__lr;
+                for (int j = 1; j < 6 && fp && ((uint64_t)fp & 7) == 0 && (uint64_t)fp > 0x1000; j++) { vm_size_t g = 0; uint64_t fr[2]; if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, 16, (vm_address_t)fr, &g) || g != 16) break; f->lr[j] = fr[1]; fp = (uint64_t *)fr[0]; } } } }
+    pthread_mutex_unlock(&g_ht_mu);
+}
+static void heaptrack_install(void) {
+    const char *e = getenv("DM_HEAPTRACK"); if (!e) return;
+    const char *c = strchr(e, ':'); if (!c) return; char mod[16] = {0}; memcpy(mod, e, (size_t)(c - e) < 15 ? (size_t)(c - e) : 15);
+    module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, mod)) m = &g_mod[i];
+    if (!m) return;
+    g_ht = calloc(HT_CAP, sizeof *g_ht);
+    if (getenv("DM_HEAPTRACK_POISON")) { g_hts_k = calloc(HT_SCAP, 8); g_hts_v = calloc(HT_SCAP, 8); g_hts_lr = calloc(HT_SCAP, 32); g_hl = calloc(1u << 21, sizeof *g_hl); g_hl_idx = calloc(HT_SCAP, 4); }
+    for (const char *p = c + 1; *p && g_nhts < 16; ) {
+        char kind = *p++; uint64_t off = strtoull(p, (char **)&p, 16); int reg = -1, oreg = -1;
+        if (*p == '/') { p++; if (*p == 'x') p++; reg = (int)strtol(p, (char **)&p, 10); }
+        if (*p == '/') { p++; if (*p == 'x') p++; oreg = (int)strtol(p, (char **)&p, 10); }
+        g_hts[g_nhts++] = (ht_site){(uint64_t)m->base + off, kind, reg, oreg};
+        probe_add(m, off, -1, ht_hit);
+        while (*p == ',') p++;
+    }
+    LOG("DM_HEAPTRACK: %d sites", g_nhts);
+}
+#else
+void dm_heaptrack_which(const uint64_t *x, int n) { (void)x; (void)n; }
+void dm_heaptrack_rzscan(void) {}
+void dm_heaptrack_scan(void) {}
+static void heaptrack_install(void) {}
+#endif
 void probe_install(void) {
+    heaptrack_install();
 #if !TARGET_OS_IPHONE
     crash_set_trap_hook(probe_hit);
     const char *frames = getenv("DM_PROBE_FRAMES");

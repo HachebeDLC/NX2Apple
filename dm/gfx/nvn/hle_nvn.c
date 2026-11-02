@@ -278,8 +278,36 @@ NVN(nvnSamplerPoolGetSize, int, const NVNsamplerPool *sp) { return ((const dpool
 
 // ---------- Textures ----------
 #define TB(b) ((tex_builder_t *)(b))
+// NVN-GL interop: a texture builder may name a GL texture (nvnTextureBuilderSetGLTextureName); the texture initialized from it is that GL texture, resolved through the GL
+// layer (nvn_mtl.m mtl_tex_gl, hle_gl.m dm_gl_tex_mtl). The name is kept beside the builder (its layout has no spare field). NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS:
+// Scaleform renders the UI with GLES 3.0 into GL textures that the game's NVN renderer then samples
+__attribute__((weak)) int dm_gl_tex_size(uint32_t name, uint32_t *w, uint32_t *h) { (void)name; (void)w; (void)h; return 0; }
+__attribute__((weak)) void dm_gl_sync_wait(uint64_t serial) { (void)serial; }
+__attribute__((weak)) uint64_t dm_gl_sync_done(void) { return 1; }
+void mtl_tex_gl(uint64_t serial, uint32_t name);
+static struct { const void *b; uint32_t name; } g_bgl[64]; static pthread_mutex_t g_bgl_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t bgl_get(const void *b) { uint32_t n = 0; pthread_mutex_lock(&g_bgl_mu); for (int i = 0; i < 64; i++) if (g_bgl[i].b == b) { n = g_bgl[i].name; break; } pthread_mutex_unlock(&g_bgl_mu); return n; }
+static void bgl_set(const void *b, uint32_t name) {
+    pthread_mutex_lock(&g_bgl_mu); int k = -1;
+    for (int i = 0; i < 64; i++) if (g_bgl[i].b == b) { k = i; break; }
+    if (k < 0 && name) for (int i = 0; i < 64; i++) if (!g_bgl[i].b) { k = i; break; }
+    if (k >= 0) { g_bgl[k].b = name ? b : NULL; g_bgl[k].name = name; } else if (name) LOG("[RED] more than 64 texture builders with a GL texture name at once");
+    pthread_mutex_unlock(&g_bgl_mu);
+}
+NVN_NOPROTO(nvnTextureBuilderSetGLTextureName, void, NVNtextureBuilder *b, uint32_t name) { bgl_set(b, name); }
+NVN_NOPROTO(nvnTextureBuilderGetGLTextureName, uint32_t, const NVNtextureBuilder *b) { return bgl_get(b); }
+// GL → NVN: the GL layer commits its work at glFenceSync and hands out that command buffer's serial as the sync; the NVN sync made from it is signalled once that work completed
+// (waited here on the CPU: the GL layer runs on its own Metal queue). NVN → GL: the GL sync made from an NVN sync is created after the NVN work completed, so GL waits on nothing
+NVN_NOPROTO(nvnSyncInitializeFromFencedGLSync, NVNboolean, NVNsync *s, NVNdevice *d, const void *gl) {
+    (void)d; dm_gl_sync_wait((uint64_t)(uintptr_t)gl); *(sync_t *)s = (sync_t){MAGIC('S', 'Y', 'N', 'C'), 1, 0}; return 1;
+}
+NVN_NOPROTO(nvnSyncCreateGLSync, NVNboolean, const NVNsync *s, uint64_t *gl) {
+    const sync_t *o = (const sync_t *)s; if (o->fenced && o->fence) mtl_wait(o->fence, 2000000000ull);
+    if (gl) *gl = dm_gl_sync_done(); return 1;   // a real GLsync of the GL layer (the game may wait for it and delete it)
+}
 NVN(nvnTextureBuilderSetDefaults, void, NVNtextureBuilder *b) {
     NVNdevice *dev = TB(b)->dev; memset(b, 0, sizeof(tex_builder_t)); TB(b)->dev = dev;
+    bgl_set(b, 0);
     TB(b)->d.target = NVN_TEXTURE_TARGET_2D; TB(b)->d.width = TB(b)->d.height = TB(b)->d.depth = TB(b)->d.levels = 1;
 }
 NVN(nvnTextureBuilderSetDevice, void, NVNtextureBuilder *b, NVNdevice *d) { TB(b)->dev = d; }
@@ -459,7 +487,11 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8); o->set_swz = s->set_swz; o->stencil = s->stencil; o->swz = s->swz;
     nvn_tex_layout(&o->d, &o->L);
     o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
-    o->serial = nvn_new_serial(); mtl_tex_init(o);
+    o->serial = nvn_new_serial();
+    {   uint32_t gn = bgl_get(b);   // over a GL texture: its size, and a format so the description is valid (the MTLTexture is the GL layer's)
+        if (gn) { uint32_t w, h; if (dm_gl_tex_size(gn, &w, &h)) { o->d.width = w; o->d.height = h; } if (!o->d.format) o->d.format = NVN_FORMAT_RGBA8; mtl_tex_gl(o->serial, gn);
+                  static int n; if (n++ < 4) LOG("[nvn] texture ser=%llu over GL texture %u (%ux%u)", (unsigned long long)o->serial, gn, o->d.width, o->d.height); } }
+    mtl_tex_init(o);
     {   // DM_NVN_TEXINFO=WxH also logs every texture of that size as it is initialized (render targets included): which ones share storage, and how their descriptions differ
         static int ti = -1; static uint32_t tw, th;
         if (ti < 0) { const char *e = getenv("DM_NVN_TEXINFO"); ti = e && sscanf(e, "%ux%u", &tw, &th) == 2; }
@@ -477,7 +509,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     ft_add(o);
     return 1;
 }
-NVN(nvnTextureFinalize, void, NVNtexture *t) { ft_del(TX(t)->serial); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
+NVN(nvnTextureFinalize, void, NVNtexture *t) { ft_del(TX(t)->serial); mtl_tex_gl(TX(t)->serial, 0); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
 NVN(nvnTextureGetFlags, NVNtextureFlags, const NVNtexture *t) { return (NVNtextureFlags)CTX(t)->d.flags; }
 NVN(nvnTextureGetWidth, int, const NVNtexture *t) { return (int)CTX(t)->d.width; }
 NVN(nvnTextureGetHeight, int, const NVNtexture *t) { return (int)CTX(t)->d.height; }

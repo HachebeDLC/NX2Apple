@@ -141,6 +141,7 @@ int main(int argc, char **argv) {
         LOG("host loading already finished early in the background (dm_host_preload_start)");
     } else host_preload(argc, argv);
     { void dm_fps_state_apply(void); dm_fps_state_apply(); }   // frame rate and render scale into the frame step state page (loader.c): the iOS launcher sets them after the loading began
+    { void dm_game_res_apply(void); dm_game_res_apply(); }   // a game's output size in its own display mode table (hle_fpslock.c k_res), before it reads it
     front_run(guest_main);
     return 0;
 }

@@ -195,6 +195,28 @@ def find_key(img, lo, hi, pak):
         if len(set(w)) < 20: continue
         d = aes_decrypt(w, blk)
         if 0 < struct.unpack_from('<i', d)[0] < 512 and d[4:7] == b'../': return w
+    return find_split_key(img, lo, blk)
+
+def _sx(v, b): return v - (1 << b) if v >> (b - 1) & 1 else v
+
+def find_split_key(img, lo, blk):
+    """The AES key as two 16-byte halves at separate places (DRAGON BALL Sparking! ZERO): the targets of ADRP (+ ADD) + LDR q / LDP q in main's code, paired within 0x200 bytes of code"""
+    loads, page, addv = [], {}, {}
+    for a in range(0, lo, 4):
+        i = struct.unpack_from('<I', img, a)[0]; rd, rn = i & 31, (i >> 5) & 31
+        if i & 0x9f000000 == 0x90000000: page[rd] = (a & ~0xfff) + (_sx(((i >> 29) & 3) | (((i >> 5) & 0x7ffff) << 2), 21) << 12); addv.pop(rd, None)   # ADRP
+        elif i & 0xffc00000 == 0x91000000 and rn in page: addv[rd] = page[rn] + ((i >> 10) & 0xfff)   # ADD imm
+        elif i & 0xffc00000 == 0x3dc00000 and (b := page.get(rn, addv.get(rn))) is not None: loads.append((a, b + ((i >> 10) & 0xfff) * 16))   # LDR q
+        elif i & 0xffc00000 == 0xad400000 and (b := page.get(rn, addv.get(rn))) is not None:   # LDP q, q
+            t = b + _sx((i >> 15) & 0x7f, 7) * 16; loads += [(a, t), (a, t + 16)]
+    for k, (ak, p) in enumerate(loads):
+        for m in range(max(0, k - 6), min(len(loads), k + 7)):
+            am, q = loads[m]
+            if m == k or abs(am - ak) > 0x200 or not (0 <= p < len(img) - 16 and 0 <= q < len(img) - 16): continue
+            w = img[p:p + 16] + img[q:q + 16]
+            if len(set(w)) < 16: continue
+            d = aes_decrypt(w, blk)
+            if 0 < struct.unpack_from('<i', d)[0] < 512 and d[4:7] == b'../': return w
     return None
 
 class Pak:
@@ -314,6 +336,7 @@ def lz4_shaders(b, a):
     return out
 
 TOC_MAGIC, IO_SHADER_LIBRARY, IO_SHADER_CODE = b'-==--==--==--==-', 8, 9   # EIoChunkType in Unreal Engine 5 (TOC version 4 and later; 4.27 numbers its chunk types otherwise)
+IO_EXPORT_BUNDLE = 1   # ExportBundleData in both numberings: a cooked package's exports, where Unreal 4.27 keeps material shader maps inline (inline_shaders)
 
 class Toc:
     """An IoStore container: the .utoc's chunk table and compression blocks, the data in the .ucas beside it (<name>_s<n>.ucas for partitions after the first). A chunk is a range of the
@@ -409,6 +432,78 @@ def io_archive(toc, i, decode, chunk=None):
     for e, c in zip(ents, code): out += struct.pack('<QIIB', off, len(c), len(c), e & 0xF); off += len(c)
     out += struct.pack('<I', 0) + struct.pack(f'<I{len(idx)}I', len(idx), *idx)
     return bytes(out) + b''.join(code)
+
+def plain_archive(shaders):
+    """A version 2 shader code archive of decoded shaders [(code, frequency)], one shader map holding them all and zero hashes (shader_split.py reads only the entries and the code)"""
+    n = len(shaders); out = bytearray(struct.pack('<II', ARCHIVE_VERSION, 1) + bytes(20) + struct.pack('<I', n) + bytes(20 * n) + struct.pack('<IIIII', 1, 0, n, 0, 0) + struct.pack('<I', n)); off = 0
+    for c, fr in shaders: out += struct.pack('<QIIB', off, len(c), len(c), fr); off += len(c)
+    out += struct.pack('<I', 0) + struct.pack(f'<I{n}I', n, *range(n))
+    return bytes(out) + b''.join(c for c, _ in shaders)
+
+def inline_shader_maps(d, decode, seen):
+    """Shaders kept inline in cooked Unreal 4.27 packages (DRAGON BALL Sparking! ZERO: the material shader maps in its IoStore export bundles, the global ones in
+    Engine/GlobalShaderCache-SP_GLSL_SWITCH.bin; it has no shader code archive): FShaderMapResourceCode's entries are {i32 code length, the code, i32 raw size, u8 frequency}, the code an
+    Oodle stream (Mermaid, 8C 0A) when shorter than its raw size, else the LSLG record itself. Found by that frame around an Oodle header or an LSLG magic; kept when it decodes to an LSLG record
+    (lslg) whose stage matches the frequency. seen = the shader hashes taken so far (one copy of each). → [(record, frequency)]"""
+    import hashlib, re
+    out = []
+    for m in re.finditer(rb'\x8c[\x00-\x0f]|LSLG', d):
+        p = m.start()
+        if p < 4: continue
+        n = struct.unpack_from('<I', d, p - 4)[0]
+        if not 64 <= n <= len(d) - p - 5: continue
+        raw, fr = struct.unpack_from('<IB', d, p + n)
+        if fr not in FREQ or not n <= raw < 1 << 22 or (raw == n) != (d[p] == 0x4c): continue
+        c = d[p:p + n]
+        if raw != n:
+            if b'LSLG' not in c[:64]: continue   # Mermaid keeps the record's first bytes as literals
+            try: c = decode(c, raw)
+            except ValueError: continue
+        rec = lslg(c)
+        if not rec or FREQ[fr] != {'SV': 'vs', 'SH': 'hs', 'SD': 'ds', 'SG': 'gs', 'SP': 'ps', 'SC': 'cs'}.get(rec[0]): continue
+        h = hashlib.sha1(c).digest()
+        if h not in seen: seen.add(h); out.append((c, fr))
+    return out
+
+def toc_chunks(toc, idxs, decode):
+    """The chunks idxs of an IoStore container, each block decoded once (chunks in stream order share blocks): yields (index, bytes)"""
+    cache = {}
+    for i in sorted(idxs, key=lambda i: toc.ranges[i][0]):
+        off, ln = toc.ranges[i]
+        if not ln: continue
+        first, last = off // toc.block_size, (off + ln - 1) // toc.block_size; parts = []
+        for k in range(first, last + 1):
+            if k not in cache:
+                at, size, raw, m = toc.blocks[k]; f = toc.ucas(at // toc.part_size); f.seek(at % toc.part_size)
+                b = f.read((size + 15) & ~15 if toc.encrypted else size)
+                if toc.encrypted: b = aes_decrypt(toc.key, b)[:size]
+                meth = toc.methods[m - 1] if m else ''
+                cache[k] = b[:raw] if not meth else decode(b, raw) if meth == 'Oodle' else None
+                if cache[k] is None: raise ValueError(f'{toc.path}: compression method {meth} is not read')
+            parts.append(cache[k])
+        for k in [k for k in cache if k < first]: del cache[k]
+        s = off - first * toc.block_size
+        yield i, b''.join(parts)[s:s + ln]
+
+def inline_job(romfs, key, decode, work, listing):
+    """The inline shaders (inline_shaders) of every pak file and every IoStore export bundle, one decoded archive per container (ShaderArchive-Inline-<container>), for a game without shader
+    code archives (DRAGON BALL Sparking! ZERO). Writes them into <work>/archives and adds them to listing"""
+    seen = set()
+    def put(name, src, path, shaders):
+        if not shaders: return
+        name = f'ShaderArchive-Inline-{name}.ushaderbytecode'
+        open(os.path.join(work, 'archives', name), 'wb').write(plain_archive(shaders))
+        listing.append(dict(name=name, pak=os.path.relpath(src, romfs), path=path, shaders=len(shaders), compressed=0, compression='inline, decoded'))
+    for pak in unreal_paks(romfs):
+        p = Pak(pak, key); found = []
+        for path in sorted(p.files): found += inline_shader_maps(p.read(path, decode=decode), decode, seen)
+        put(os.path.splitext(os.path.basename(pak))[0] + '-pak', pak, 'pak files', found)
+    for dp, _, fs in os.walk(romfs):
+        for f in sorted(fs):
+            if not f.endswith('.utoc'): continue
+            t = Toc(os.path.join(dp, f), key); found = []
+            for _, b in toc_chunks(t, t.of_type(IO_EXPORT_BUNDLE), decode): found += inline_shader_maps(b, decode, seen)
+            put(os.path.splitext(f)[0], os.path.join(dp, f), 'export bundles', found)
 
 def mount_order(path):
     """A container's place in the mount stack: the game's container first, then the numbered patch chunks in order. A chunk ID that two containers both have resolves to the later container, as in
@@ -507,6 +602,7 @@ def job(romfs, main_nso, work, decode=None):
             for i in comp:
                 off, size, raw, _ = a['shaders'][i]; recs.append((name, i, b[a['code'] + off:a['code'] + off + size], raw))
             listing.append(dict(name=name, pak=os.path.relpath(pak, romfs), path=path, shaders=len(a['shaders']), compressed=len(comp), compression=how))
+    if not listing and decode and unreal_paks(romfs): inline_job(romfs, key, decode, work, listing)   # no shader code archive: the shader maps inline in the packages
     with open(os.path.join(work, 'oodle.job'), 'wb') as f:
         f.write(struct.pack('<II', JOB_MAGIC, len(recs)))
         for _, _, c, raw in recs: f.write(struct.pack('<II', len(c), raw)); f.write(c)

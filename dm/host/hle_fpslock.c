@@ -13,7 +13,7 @@
 // frame for two, so a shorter time showed some frames for one (30.4 fps); 30 writes the game's own 33.333 ms
 // Also: a frame time in ticks as a uint32 (scale / frame rate: 19,200,000 for the Switch's 19.2 MHz system tick), a frame step in seconds as a float (1 / frame rate), and a mode
 // switch an engine reads before it takes those fields at all (written 1 at any target)
-enum { FPS_F32, VSYNCS_I32, MS_F32, FPS_I32, TICKS_U32, SECS_F32, MODE_U32, FPS_F64 };
+enum { FPS_F32, VSYNCS_I32, MS_F32, FPS_I32, TICKS_U32, SECS_F32, MODE_U32, FPS_F64, FPS_U8 };
 #define MS_MARGIN 0.5f
 static float ms_want(int fps) { return 1000.0f / (float)fps - (fps == 60 ? MS_MARGIN : 0); }
 static const struct { const char *build, *what; uint64_t ptr_off; uint32_t field; uint8_t kind, copies; uint32_t scale; } k_locks[] = {
@@ -42,6 +42,14 @@ static const struct { const char *build, *what; uint64_t ptr_off; uint32_t field
     // stored at +0x10) and main+0x36164f4 (int, AsVariableInt at +0x10)
     { "f7ec03e4cb9de3bd8319d4e899d2e9cc", "Unreal t.MaxFPS", 0x7f41908 + 0x10, 0, FPS_F32, 2 },
     { "f7ec03e4cb9de3bd8319d4e899d2e9cc", "Unreal rhi.SyncInterval", 0x7dedf38 + 0x10, 0, VSYNCS_I32, 2 },
+    // DRAGON BALL Sparking! ZERO 2.0.73: Unreal Engine 4.27's t.MaxFPS and rhi.SyncInterval, as DRAGON QUEST VII Reimagined's (names in UTF-16). The game asks for present interval 2.
+    // Registered at main+0x40a2968 (float, IConsoleManager slot 2; AsVariableFloat stored at +0x10) and main+0x250c9b0 (int, slot 1; AsVariableInt at +0x10)
+    { "7b53433fa04477fc8a540bd80d5ce665", "Unreal t.MaxFPS", 0x9a2ffe0 + 0x10, 0, FPS_F32, 2 },
+    { "7b53433fa04477fc8a540bd80d5ce665", "Unreal rhi.SyncInterval", 0x98ea2d8 + 0x10, 0, VSYNCS_I32, 2 },
+    // Its DefaultEngine.ini also sets bUseFixedFrameRate=True / FixedFrameRate=30: UEngine::UpdateTimeAndHandleMaxTickRate (main+0x40abc6c, vtable slot 0x308) then waits for and steps
+    // by 1 / FixedFrameRate, a float at +0x9c8 of the engine (its UPROPERTY params at main+0x88a28f8; bUseFixedFrameRate is bit 6 of +0x9c4), so t.MaxFPS alone left it at 30 and
+    // raising only the limit would run the game twice as fast. GEngine is main+0x9a2ea20 (bss; FEngineLoop::Tick loads it through the GOT entry main+0x8d02028 before the call at main+0xa8e8)
+    { "7b53433fa04477fc8a540bd80d5ce665", "Unreal FixedFrameRate", 0x9a2ea20, 0x9c8, FPS_F32, 1 },
     // FINAL FANTASY RESONANCE 1.0.1: Unreal Engine 5.6.1's t.MaxFPS and rhi.SyncInterval, the same layout (names in UTF-16). The engine's Switch device profile sets rhi.syncinterval=2
     // (BaseSwitchDeviceProfiles.ini). Registered at main+0x33a4dec (float, IConsoleManager slot 2; AsVariableFloat stored at +0x10) and main+0x149e0bc (int, slot 1; AsVariableInt at +0x10)
     { "84e182f72ee1da4f477804bd05b54c15", "Unreal t.MaxFPS", 0x8c29af0 + 0x10, 0, FPS_F32, 2 },
@@ -77,6 +85,15 @@ static const struct { const char *build, *what; uint64_t ptr_off; uint32_t field
     // this row the game keeps 30 fps at the right speed (the simulation at 60 and the regulator at 30: match clock as at 30). The game asks for present interval 2
     // (BaseDisplaySettings.PresentInterval), which the profile's present_interval display ignores
     { "a48c0de3bc353efa0e4d359bde05ef24", "FIFA frame regulator", 0xda20e38, 0x8, FPS_F64, 2, 0 },
+    // NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS 1.0.1: CyberConnect2's frame rate, a byte at +0xa02 of the graphics system (the global at main+0x428ad60, read through the GOT
+    // entry main+0x2060c98; the Lua binding ccGetFrameRate main+0x82a7b0 returns it), and the vsyncs per frame at +0x558 the frame loop waits for. Its constructor sets 30
+    // (main+0x10f3588) and SetFrameRate (main+0x10f6438) takes any divisor of 60, storing 60 / fps in +0x558: the engine's own 60 fps mode (the one its online matches exchange with
+    // the PC version), so the game advances by the vsyncs it waits, at the same speed (checked: the tutorial's hold-for-2-seconds counter reads the same at 1.0 s at 30 and at 60 fps).
+    // What paces it: SetFrameRate hands 60 / fps to main+0x10b7590, which stores it at +0x280 of the display object (the global at main+0x4289930, GOT main+0x2079b88); the vsync
+    // thread (main+0x10b9c3c) signals the frame event every that many vsyncs and the frame loop waits for it (main+0x10b9a3c). The two fields above are what the game reads back
+    { "d9c42d45d9850c5804749ed9b44198bf", "CC2 frame rate", 0x428ad60, 0xa02, FPS_U8, 1 },
+    { "d9c42d45d9850c5804749ed9b44198bf", "CC2 vsyncs per frame", 0x428ad60, 0x558, VSYNCS_I32, 1 },
+    { "d9c42d45d9850c5804749ed9b44198bf", "CC2 vsyncs per frame event", 0x4289930, 0x280, VSYNCS_I32, 1 },
 };
 #define NLOCKS ((int)(sizeof k_locks / sizeof k_locks[0]))
 
@@ -134,6 +151,41 @@ static void dynamic_resolution_tick(void) {
         uint32_t *p = (uint32_t *)(uintptr_t)(a + 4);
         dm_guest_write_prepare(p, 4);
         __atomic_store_n(p, 0x3f800000u, __ATOMIC_RELAXED);
+    }
+}
+// Unreal float console variables the host sets over the device profile's value (same TAutoConsoleVariable layout as dm_ctl_cvar_f32: +0x10 points to the game thread's copy, then the
+// render thread's). The value is the row's, the environment variable overrides it (Documents/env.txt on the phone), 0 leaves the game's own. DRAGON BALL Sparking! ZERO: its
+// SwitchDeviceProfiles.ini renders the 3D scene at r.ScreenPercentage=66.66 of the 1920x1080 output (1280x720); 100 renders it at 1920x1080 (TAutoConsoleVariable at main+0x9a049a0,
+// registered with the name's reference at main+0x3c70128)
+static const struct { const char *build, *what, *env; uint64_t cvar; float value, lo, hi; } k_cvars[] = {
+    { "7b53433fa04477fc8a540bd80d5ce665", "Unreal r.ScreenPercentage", "DM_SCREEN_PERCENTAGE", 0x9a049a0, 100.0f, 25.0f, 200.0f },
+};
+#define NCVARS ((int)(sizeof k_cvars / sizeof k_cvars[0]))
+static int rd(uint64_t a, void *out, size_t n);
+static void cvar_tick(void) {
+    static int state = -2, rows[NCVARS], nrow, nlog[NCVARS]; static float want[NCVARS]; static uint8_t *base;
+    if (state == -1) return;
+    if (state == -2) {
+        state = -1;
+        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
+            for (int k = 0; k < NCVARS; k++) if (!strcmp(g_mod[i].build_id, k_cvars[k].build)) {
+                const char *e = getenv(k_cvars[k].env); float pv = strtof(DM_GAME_SCREEN_PERCENTAGE, NULL), v = e ? strtof(e, NULL) : pv ? pv : k_cvars[k].value;   // the profile's screen_percentage, else the row's
+                if (v != 0 && !(v >= k_cvars[k].lo && v <= k_cvars[k].hi)) { LOG("[RED] %s=%s: must be 0 or %g to %g; using %g", k_cvars[k].env, e, k_cvars[k].lo, k_cvars[k].hi, k_cvars[k].value); v = k_cvars[k].value; }
+                if (v == 0) { LOG("main: %s left as the game sets it (%s=0)", k_cvars[k].what, k_cvars[k].env); continue; }
+                want[nrow] = v; rows[nrow++] = k; base = g_mod[i].base;
+            }
+        if (!nrow) return;
+        state = 0;
+    }
+    for (int r = 0; r < nrow; r++) {
+        int k = rows[r]; uint64_t obj;
+        if (!rd((uint64_t)(uintptr_t)(base + k_cvars[k].cvar + 0x10), &obj, sizeof obj) || !obj) continue;   // not registered yet
+        for (int c = 0; c < 2; c++) {
+            float cur, *p = (float *)(uintptr_t)(obj + 4 * (uint64_t)c);
+            if (!rd((uint64_t)(uintptr_t)p, &cur, sizeof cur) || cur == want[r] || !(cur > 0 && cur <= 400)) continue;
+            dm_guest_write_prepare(p, sizeof *p); __atomic_store_n((uint32_t *)p, *(uint32_t *)&want[r], __ATOMIC_RELAXED);
+            if (nlog[r] < 8) { nlog[r]++; LOG("main: %s%s %g → %g (%s)", k_cvars[k].what, c ? " (render thread)" : " (game thread)", cur, want[r], getenv(k_cvars[k].env) ? k_cvars[k].env : "host default"); }
+        }
     }
 }
 
@@ -210,6 +262,7 @@ static void fb_tick(int target, const char *src) {
 
 void dm_fps_lock_tick(void) {
     dynamic_resolution_tick();   // separate from the FPS cap
+    cvar_tick();
     static int state = -2, rows[NLOCKS], nrow, nlog[NLOCKS], target, nier; static uint8_t *base; static const char *src; static uint32_t display;
     if (state == -1) return;
     if (state == -2) {
@@ -264,6 +317,13 @@ void dm_fps_lock_tick(void) {
         }
         for (int c = 0; c < k_locks[k].copies; c++) {
             uint64_t a = obj + k_locks[k].field + 4 * (uint64_t)c; uint32_t cur, want; char was[16];
+            if (k_locks[k].kind == FPS_U8) {   // one byte: read and written alone (its neighbours are other fields)
+                uint8_t b, w8 = (uint8_t)target;
+                if (!rd(a, &b, 1) || b == w8 || b < 10 || b > 60) break;
+                uint8_t *p8 = (uint8_t *)(uintptr_t)a; dm_guest_write_prepare(p8, 1); __atomic_store_n(p8, w8, __ATOMIC_RELAXED);
+                if (nlog[k] < 8) { nlog[k]++; LOG("main: %s %u → %d fps (%s)", k_locks[k].what, b, target, src); }
+                break;
+            }
             if (!rd(a, &cur, sizeof cur)) break;
             if (k_locks[k].kind == FPS_F32 || k_locks[k].kind == MS_F32) {
                 int ms = k_locks[k].kind == MS_F32; float f, w = ms ? ms_want(target) : (float)target; memcpy(&f, &cur, sizeof f); memcpy(&want, &w, sizeof want);
@@ -298,6 +358,30 @@ void dm_fps_lock_tick(void) {
                 LOG("main: %s%s %s → %s (%s)", k_locks[k].what, k_locks[k].copies > 1 ? (c ? " (render thread)" : " (game thread)") : "", was, now, src); }
         }
     }
+}
+
+// Output sizes picked from a game's own display mode table (data in main's read-only block, which the loader leaves writable), written before the game runs (main.c): the rows the
+// game uses take the contents of the row for the asked height. The profile's display_height (DM_DISPLAY_HEIGHT overrides; 0 = the game's own).
+// NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS 1.0.1: 24-byte rows {mode, 0, 0, width, height, 0} at main+0x1ada250 (3840x2160 down to 960x720); the graphics system's init
+// (main+0x10f65ac) takes the row its start parameters name (+0xfc: 15 = 1600x900) and keeps its address at +0x530; mode → size at main+0x10f5b50 sizes the swapchain and the
+// scene targets from it, and the 2D layouts follow the size. Row 10 (1280x720) is rewritten too, for a start that names it
+static const struct { const char *build, *what; uint64_t table; uint32_t stride; int8_t dst[2]; struct { uint16_t h; int8_t row; } m[3]; } k_res[] = {
+    { "d9c42d45d9850c5804749ed9b44198bf", "display mode table", 0x1ada250, 24, {15, 10}, {{720, 10}, {900, 15}, {1080, 8}} },
+};
+#define NRES ((int)(sizeof k_res / sizeof k_res[0]))
+void dm_game_res_apply(void) {
+    const char *e = getenv("DM_DISPLAY_HEIGHT"); int h = e ? atoi(e) : DM_GAME_DISPLAY_HEIGHT;
+    if (!h) return;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
+        for (int k = 0; k < NRES; k++) if (!strcmp(g_mod[i].build_id, k_res[k].build)) {
+            int src = -1; for (int j = 0; j < 3; j++) if (k_res[k].m[j].h == h) src = k_res[k].m[j].row;
+            if (src < 0) { LOG("[RED] DM_DISPLAY_HEIGHT=%d: this game takes 720, 900 or 1080; keeping its own size", h); return; }
+            uint8_t *t = g_mod[i].base + k_res[k].table, row[64]; uint32_t n = k_res[k].stride;
+            memcpy(row, t + (size_t)src * n, n);
+            for (int d = 0; d < 2; d++) { uint8_t *p = t + (size_t)k_res[k].dst[d] * n; dm_guest_write_prepare(p, n); memcpy(p, row, n); }
+            uint32_t w[6]; memcpy(w, row, sizeof w);
+            LOG("main: %s: rows %d and %d → %ux%u (%s)", k_res[k].what, k_res[k].dst[0], k_res[k].dst[1], w[3], w[4], e ? "DM_DISPLAY_HEIGHT" : "game profile display_height");
+        }
 }
 
 // The Mac's DM_CTL "cvarf <main offset> <value>" (hle_hid.c), for trying an Unreal console variable while the game runs: the TAutoConsoleVariable at main+offset holds at +0x10

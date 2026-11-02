@@ -163,6 +163,18 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         for (int k = 0; k < 6; k++) off("", w[k]);
         fputc('\n', stderr);
     }
+    if (getenv("DM_CRASH_AROUND")) {   // diagnostic: 0x200 bytes on each side of the guest-heap addresses the registers hold (what overwrote a heap block)
+        uint64_t done[8]; int nd = 0;
+        for (int i = 0; i < 29 && nd < 8; i++) {
+            uint64_t a = uc->uc_mcontext->__ss.__x[i] & ~0xfull; if (a < 0x7000000000ull || a >= 0x7200000000ull) continue;
+            int dup = 0; for (int j = 0; j < nd; j++) dup |= done[j] == a; if (dup) continue; done[nd++] = a;
+            uint64_t w[128]; vm_size_t got = 0; if (vm_read_overwrite(mach_task_self(), (vm_address_t)(a - 0x200), sizeof w, (vm_address_t)w, &got) != KERN_SUCCESS || got != sizeof w) continue;
+            fprintf(stderr, "[dm] around x%d=%#llx:", i, (unsigned long long)a);
+            for (int k = 0; k < 128; k++) fprintf(stderr, "%s%016llx", k % 4 ? " " : (k == 64 ? "\n[dm] >>" : "\n[dm]   "), (unsigned long long)w[k]);
+            fputc('\n', stderr);
+        }
+    }
+    { extern void dm_heaptrack_scan(void); extern void dm_heaptrack_which(const uint64_t *, int); dm_heaptrack_which((const uint64_t *)uc->uc_mcontext->__ss.__x, 29); dm_heaptrack_scan(); extern void dm_heaptrack_rzscan(void); dm_heaptrack_rzscan(); }
     dm_backtrace(uc->uc_mcontext->__ss.__fp);
     // Stack scan: when the frame chain is broken (a return address was overwritten, pc = lr lands on garbage) the backtrace prints nothing; scan 512 words up from sp and list everything that resolves to a module / host symbol (nearest callers first)
     {   uint64_t sp = uc->uc_mcontext->__ss.__sp;   // The frame just popped (when a return address was overwritten, the bad value and the leftovers of whatever overwrote it sit below sp)

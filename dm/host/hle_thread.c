@@ -290,7 +290,42 @@ static void qos_apply(thr_t *t) {   // on the thread itself, holding G (prio and
 }
 // A host helper thread (audio notify / silent sink, vsync, movie decode) created from a guest thread inherits that thread's class; under DM_QOS_MAP it sets its own instead
 void dm_host_helper_qos(qos_class_t q) { if (g_qos_map) pthread_set_qos_class_self_np(q, 0); }
+// DM_CORELOCK=1 (experiment): on Horizon a thread pinned to one core runs only while that core is its; threads of equal priority on a core are not time-sliced and switch only when one
+// blocks. Code that leaves shared state unlocked between such threads is safe there and races here, where every guest thread runs in parallel. With the switch on, a game thread
+// whose affinity is one core holds that core's lock while it runs guest code and lets it go in the SVCs that block (sleep / yield, waits, lock arbitration)
 static const char *thr_name(thr_t *t, char *buf, size_t n);
+// DM_CORELOCK=1: every such thread; DM_CORELOCK=<name>,<name>…: only threads whose name contains one of them (a thread blocked in host code, not in an SVC, would hold its core)
+static const char *g_cl_names;
+static int corelock_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_CORELOCK"); on = e && *e && strcmp(e, "0") != 0; if (on && strcmp(e, "1")) g_cl_names = e;
+    if (on) LOG("DM_CORELOCK: threads pinned to one core run one at a time per core (%s)", g_cl_names ? g_cl_names : "all of them"); } return on; }
+static __thread int tl_cl_match = -1;   // this thread's name matched the list: -1 not decided yet (no name)
+static int cl_wanted(thr_t *t) {
+    if (!g_cl_names) return 1;
+    if (tl_cl_match >= 0) return tl_cl_match;
+    char nb[64]; const char *nm = thr_name(t, nb, sizeof nb); if (!nm || !*nm) return 0;
+    // entries are name parts; one starting with '-' excludes the threads whose name has it (a list of exclusions only takes every other thread)
+    int inc = 0, exc = 0, any_inc = 0; const char *p = g_cl_names;
+    while (*p) { const char *q = strchr(p, ','); size_t l = q ? (size_t)(q - p) : strlen(p); char w[64]; if (l >= sizeof w) l = sizeof w - 1; memcpy(w, p, l); w[l] = 0;
+        if (w[0] == '-') { if (w[1] && strstr(nm, w + 1)) exc = 1; } else if (l) { any_inc = 1; if (strstr(nm, w)) inc = 1; }
+        p = q ? q + 1 : p + l; }
+    return tl_cl_match = !exc && (inc || !any_inc);
+}
+static pthread_mutex_t g_core_mu[4] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
+static __thread int tl_core_held = -1;
+static thr_t *g_core_holder[4];
+static void cl_acquire(thr_t *t) {
+    static int global = -1; if (global < 0) global = getenv("DM_CORELOCK_GLOBAL") != NULL;   // one lock for every core: one guest thread at a time
+    if (!corelock_on() || !t || t->host_owned || !t->mask || (!global && (t->mask & (t->mask - 1))) || !cl_wanted(t)) return;
+    int c = global ? 0 : __builtin_ctzll(t->mask); if (c > 3 || tl_core_held == c) return;
+    if (tl_core_held >= 0) { g_core_holder[tl_core_held] = NULL; pthread_mutex_unlock(&g_core_mu[tl_core_held]); tl_core_held = -1; }
+    for (int i = 0; ; i++) {
+        if (!pthread_mutex_trylock(&g_core_mu[c])) { tl_core_held = c; g_core_holder[c] = t; return; }
+        if (global && i == 200) return;   // global: a holder kept it 20 ms, it waits in host code; go on without it and try again at the next SVC
+        if (i == 20000) { thr_t *h = g_core_holder[c]; LOG("DM_CORELOCK: thread %#x waits 2 s for core %d, held by %#x (last svc %#x lr=%#llx)", t->handle, c, h ? h->handle : 0, h ? h->last_svc : -1, h ? (unsigned long long)h->last_lr : 0ull); }
+        struct timespec ts = {0, 100000}; nanosleep(&ts, NULL);
+    }
+}
+static void cl_release(void) { if (tl_core_held >= 0) { g_core_holder[tl_core_held] = NULL; pthread_mutex_unlock(&g_core_mu[tl_core_held]); tl_core_held = -1; } }
 static void *thread_main(void *p) {
     thr_t *t = p;
     pthread_setspecific(g_keythr, t);
@@ -306,6 +341,7 @@ static void *thread_main(void *p) {
     guest_gate_stack(1);   // the guest runs on its own stack from dm_thread_enter on: this pthread's stack below this frame is where its SVCs run
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
     { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, thr_name(t, nb, sizeof nb)); pthread_setname_np(hn); }   // the guest's name (set before StartThread) for sample / Instruments
+    cl_acquire(t);
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
     die("guest thread entry returned");
 }
@@ -317,6 +353,7 @@ static void thr_free(thr_t *t) {   // Holding G; unlink from the all-threads cha
 }
 static void wake_sync_waiters(const void *obj);
 static void thread_exit(thr_t *t) {
+    cl_release();
     t->exit_ns = now_ns(); t->exit_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
     // No logging here: the exit happens on the guest thread's own stack (some are only a dozen or so KiB), and a printf with floating point would blow the stack (real-device smoke test: SIGBUS when LibcurlResolver exits, backtrace fprintf → __dtoa). Only the time is recorded, and it is printed later in the state dump
     pthread_mutex_lock(&G);
@@ -834,9 +871,28 @@ void dm_guest_sleep_ns(int64_t ns) {
     sleep_precise(now_ns() + (uint64_t)ns);
     if (me) me->sleeping = 0;
 }
+// DM_TLS_CHECK=1 (diagnostic): at every SVC, compare this thread's guest tpidr_el0 and tpidrro_el0 values with those last seen on the other threads; a value two live threads share
+// means their thread-local data is one block
+static void tls_check(thr_t *me) {
+    static int on = -1; if (on < 0) on = getenv("DM_TLS_CHECK") != NULL; if (!on || !me) return;
+    enum { N = 256 }; static struct { thr_t *t; uint64_t tls, tlr; } seen[N]; static int n, logged; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t tls = (uint64_t)(uintptr_t)pthread_getspecific(g_keytls), tlr = (uint64_t)(uintptr_t)pthread_getspecific(g_keytlr);
+    pthread_mutex_lock(&mu);
+    int k = -1; for (int i = 0; i < n; i++) if (seen[i].t == me) k = i;
+    if (k < 0 && n < N) { k = n++; seen[k].t = me; }
+    if (k >= 0) { seen[k].tls = tls; seen[k].tlr = tlr;
+        for (int i = 0; i < n && logged < 20; i++) if (i != k && !seen[i].t->exited && ((tls && seen[i].tls == tls) || (tlr && seen[i].tlr == tlr))) {
+            char a[64], b[64]; logged++; LOG("[RED] TLS shared: thread %#x (%s) and %#x (%s): tpidr_el0 %#llx / %#llx, tpidrro_el0 %#llx / %#llx", me->handle, thr_name(me, a, sizeof a), seen[i].t->handle, thr_name(seen[i].t, b, sizeof b),
+                (unsigned long long)tls, (unsigned long long)seen[i].tls, (unsigned long long)tlr, (unsigned long long)seen[i].tlr); } }
+    pthread_mutex_unlock(&mu);
+}
 int svc_thread(int num, uint64_t *regs) {
+    tls_check(pthread_getspecific(g_keythr));
+    int blocks = tl_core_held >= 0 && (num == 0x0B || num == 0x18 || num == 0x1A || num == 0x1C || num == 0x34 || num == 0x0F);
+    if (blocks) cl_release();
     int r = svc_thread_impl(num, regs);
     thr_t *me = pthread_getspecific(g_keythr);
+    if (corelock_on() && num != 0x0A) cl_acquire(me);   // after any SVC (also the threads that run without the core, the main thread included)
     // The default path hands off only after a wake. The optional broader mode
     // also checks peers that were already runnable, without serializing every
     // game's SVCs behind unrelated busy workers by default.

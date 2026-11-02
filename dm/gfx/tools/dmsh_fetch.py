@@ -51,14 +51,17 @@ def variant(msl, bindings, om_only_ok=False):
              ''.join(f'constant bool FB_{k} [[function_constant({32 + k})]];\n' for k in range(NFB)) + \
              ''.join(f'constant bool OM_{j}_{k} [[function_constant({64 + 8 * j + k})]];\n' for j in range(len(outs)) for k in range(NFB))
     body = body.replace('using namespace metal;\n', 'using namespace metal;\n\n' + consts, 1)
-    i0 = body.find('fragment main0_out main0(')
-    i1 = body.find(')\n{', i0) if i0 >= 0 else -1   # end of signature: closing parenthesis immediately followed by a newline and an opening brace (parameter attributes contain brackets such as [[buffer(0)]])
-    if i0 < 0 or i1 < 0: return None, 'main function signature not recognized'
+    # Every fragment entry point gets the framebuffer inputs and the output locals: main0, and main0_u when dmsh_build.py fs_uint added it (integer colour targets; DRAGON BALL Sparking! ZERO:
+    # 1,455 variants left main0_u with spv_o_* references and no declarations, and none compiled)
     fbs = ''.join(f', float4 fb{k} [[color({k}), function_constant(FB_{k})]]' for k in range(NFB))
-    if body[i1 - 1] == '(': fbs = fbs[2:]   # main0() with no parameters at all: no leading comma (30 of Breath of the Wild's output-mapping-only variants)
-    body = body[:i1] + fbs + body[i1:]
+    for sig in ('fragment main0_out main0(', 'fragment main0_out_u main0_u('):
+        i0 = body.find(sig)
+        i1 = body.find(')\n{', i0) if i0 >= 0 else -1   # end of signature: closing parenthesis immediately followed by a newline and an opening brace (parameter attributes contain brackets such as [[buffer(0)]])
+        if i0 < 0 and sig.endswith('main0_u('): continue
+        if i0 < 0 or i1 < 0: return None, 'main function signature not recognized'
+        body = body[:i1] + (fbs[2:] if body[i1 - 1] == '(' else fbs) + body[i1:]   # main0() with no parameters at all: no leading comma (30 of Breath of the Wild's output-mapping-only variants)
     decl = ''.join(f'    {t} spv_o_{n} = {t}(0);\n' for t, n, c in outs)
-    body = body.replace('    main0_out out = {};\n', '    main0_out out = {};\n' + decl, 1)
+    body = body.replace('    main0_out out = {};\n', '    main0_out out = {};\n' + decl)
     for t, n, c in outs: body = body.replace(f'out.{n}', f'spv_o_{n}')
     put = ''.join(f'    if (OM_{j}_{k}) out.{n}_at{k} = spv_o_{n};\n' for j, (t, n, c) in enumerate(outs) for k in range(NFB))
     if body.count('    return out;\n') < 1: return None, 'return out not found'

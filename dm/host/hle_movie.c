@@ -741,11 +741,20 @@ static int md_out_tex(mdec_t *d, int i, void *buf) {
     if (!p || cap < 8) { LOG("[RED] movie: client buffer in native-texture mode is %zu bytes, needs 8 (a texture object)", cap); return 0x100b; }
     void *tex = p; int tw = 0, th = 0, f = nvn_host_write_texture(tex, NULL, 0, 0, 0, &tw, &th);
     if (f < 0) { LOG("[RED] movie: buffer data %p in native-texture mode is not a texture object", tex); return 0x100b; }
-    if (f != 0x25 && f != 0x38 && f != 0x6d && f != 0x37 && !d->red_img++) LOG("[RED] movie: client texture format %#x is not RGBA8 / RGBX8 (sRGB included), writing in RGBA byte order", f);   // Metroid Dread: RGBX8_SRGB
+    int bgr = f >= 0x99 && f <= 0x9c;   // BGRA8 / BGRX8, sRGB included (nvn_fmt_mtl.c): DRAGON BALL Sparking! ZERO's movies are BGRX8 (0x9a); written in RGBA order they came out blue and yellow
+    if (f != 0x25 && f != 0x38 && f != 0x6d && f != 0x37 && !bgr && !d->red_img++) LOG("[RED] movie: client texture format %#x is not RGBA8 / RGBX8 / BGRA8 / BGRX8 (sRGB included), writing in RGBA byte order", f);   // Metroid Dread: RGBX8_SRGB
     int w = d->w < tw ? d->w : tw, h = d->h < th ? d->h : th;
     // No picture (an end-of-stream output): nothing is drawn and the texture keeps the last frame, as the SDK's consumer has no frame to draw. A black frame here flashed at the
     // end of every loop of Big Brain Academy: Brain vs. Brain's activity previews, which read the end-of-stream output's buffer
-    if (d->out[i].pic && d->out[i].frm) nvn_host_write_texture(tex, d->out[i].frm, w, h, (size_t)d->w * 4, NULL, NULL);
+    if (d->out[i].pic && d->out[i].frm) {
+        const uint8_t *src = d->out[i].frm; uint8_t *sw = NULL;
+        if (bgr) {   // the decoded frame is RGBA: red and blue swapped into a copy (the frame itself stays RGBA for the other outputs)
+            size_t n = (size_t)d->w * 4 * (size_t)h; sw = malloc(n);
+            if (sw) { for (size_t k = 0; k < n; k += 4) { sw[k] = src[k + 2]; sw[k + 1] = src[k + 1]; sw[k + 2] = src[k]; sw[k + 3] = src[k + 3]; } src = sw; }
+        }
+        nvn_host_write_texture(tex, src, w, h, (size_t)d->w * 4, NULL, NULL);
+        free(sw);
+    }
     void *sy = G.nvn_sync ? G.nvn_sync(buf) : NULL; if (sy && nvn_host_signal_sync(sy) && !d->red_dec++) LOG("[RED] movie: the buffer's sync object %p is not an NVNsync", sy);
     MD_TRACE(d, 12, "GetOutputBuffer index %d → texture %p (%d×%d format %#x)%s", i, tex, tw, th, f, d->out[i].pic ? "" : " (no picture: the texture keeps its last frame)");
     // The SDK's texture mode returns the output index here: DecoderImpl::GetOutputBuffer calls CopyOutputBufferToClientTextureAndRelease (MediaCodec::renderOutputBufferAndRelease),

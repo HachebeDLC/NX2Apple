@@ -70,7 +70,9 @@ def sources(roots):
 # NVIDIA's GLSL compiler accepts more than the GLSL ES 3.20 specification, and glslang does not; these fix-ups run on the preprocessed text (glslang -E, so macros are expanded):
 #   · the GLSL ES 1.0 texture functions (89 of Digimon's fragment shaders call textureCube; with -V glslang reads textureCube as Vulkan's texture type, so a macro cannot rename it);
 #   · a redeclaration of gl_Position as a plain output (the built-in sprite shader of main declares `out float4 vPosition;` with vPosition defined as gl_Position);
-#   · textureOffset with an offset that is not a constant (the built-in FXAA shader): Metal's sample offsets are constants too, so it becomes texture at P + offset / level 0 size
+#   · textureOffset with an offset that is not a constant (the built-in FXAA shader): Metal's sample offsets are constants too, so it becomes texture at P + offset / level 0 size;
+#   · an array of samplers indexed by constants (Storm Connections' Scaleform: `uniform sampler2D tex[2];` read as tex[int(1.0)]) becomes one sampler per element, <name>_SA<k>,
+#     listed in the table as <name>[<k>] (the host's GL layer gives each element its own location, as GL does)
 OLD_TEX = [(r'\btexture2DLod\s*\(', 'textureLod('), (r'\btextureCubeLod\s*\(', 'textureLod('), (r'\btexture2DProj\s*\(', 'textureProj('),
            (r'\btexture2D\s*\(', 'texture('), (r'\btextureCube\s*\(', 'texture(')]
 
@@ -86,8 +88,16 @@ def call_args(t, i):
         elif c == ',' and depth == 1: args.append(t[start:k]); start = k + 1
     raise ValueError('unbalanced parentheses')
 
+def sampler_arrays(t):
+    for m in list(re.finditer(r'^([ \t]*uniform\s+(?:(?:highp|mediump|lowp)\s+)?sampler\w+\s+)(\w+)\s*\[\s*(\d+)\s*\]\s*;', t, flags=re.M)):
+        pre, nm, n = m.group(1), m.group(2), int(m.group(3))
+        t = t.replace(m.group(0), '\n'.join(f'{pre}{nm}_SA{k};' for k in range(n)))
+        t = re.sub(rf'\b{nm}\s*\[\s*(?:int\s*\(\s*)?(\d+)(?:\.0*)?\s*\)?\s*\]', lambda x: f'{nm}_SA{x.group(1)}', t)
+    return t
+
 def fixups(t):
     for a, b in OLD_TEX: t = re.sub(a, b, t)
+    t = sampler_arrays(t)
     t = re.sub(r'^[ \t]*out\s+(?:highp\s+|mediump\s+|lowp\s+)?vec4\s+gl_Position\s*;', '', t, flags=re.M)
     out, i = [], 0
     for m in re.finditer(r'\btextureOffset\s*\(', t):
@@ -141,6 +151,8 @@ def translate(src, stage, key, tmp):
     r = subprocess.run(['glslangValidator', '-E', '-S', stage, g + '.in'], capture_output=True, text=True)
     if r.returncode: return 'glslang -E: ' + ' | '.join(l for l in (r.stdout + r.stderr).splitlines() if 'ERROR' in l and 'compilation' not in l)[:400]
     pre = r.stdout[r.stdout.find('#version'):]   # warnings come first
+    # SPIR-V needs GLSL ES 3.10 or later; 3.00 ES source compiles unchanged as 3.10 (NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS: Scaleform's shaders are #version 300 es)
+    pre = re.sub(r'^#version\s+300\s+es\b', '#version 310 es', pre)
     open(g, 'w').write(fixups(pre))
     r = subprocess.run(['glslangValidator', '-V', '-R', '--aml', '--amb', '-S', stage, g, '-o', spv], capture_output=True, text=True)
     if r.returncode: return 'glslang: ' + ' | '.join(l for l in (r.stdout + r.stderr).splitlines() if 'ERROR' in l and 'compilation' not in l)[:400]
@@ -169,7 +181,7 @@ def translate(src, stage, key, tmp):
         if e: return e
     for t in refl.get('textures', []):
         if t.get('array'): return f'sampler array {t["name"]}'
-        f.append(f't:{t["name"]}={t["binding"]}:{t["type"]}')
+        f.append(f't:{re.sub(r"_SA(\d+)$", r"[\1]", t["name"])}={t["binding"]}:{t["type"]}')
     for k in ('separate_images', 'separate_samplers', 'images', 'ssbos', 'push_constants'):
         if refl.get(k): return f'{k} are not implemented'
     if any(int(x) > 15 for x in re.findall(r'\[\[(?:sampler|buffer)\((\d+)\)\]\]', m)): return 'a buffer or sampler slot above 15'

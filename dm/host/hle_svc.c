@@ -493,8 +493,8 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         int k = map_find(dst, size);
         if (!k || g_map[k - 1].base != dst || g_map[k - 1].size != size || g_map[k - 1].src != src) {
             pthread_mutex_unlock(&g_map_lock); LOG("UnmapMemory does not match a mapping %#llx+%#llx", dst, size); regs[0] = 0xD401; return 0; }
-        dm_guest_write_prepare((void *)src, size);
-        memcpy((void *)src, (void *)dst, size);
+        { static int nocopy = -1; if (nocopy < 0) nocopy = getenv("DM_UNMAP_NOCOPY") != NULL; if (g_flag.svc) LOG("UnmapMemory %#llx -> %#llx +%#llx%s", dst, src, size, nocopy ? " (not copied back)" : "");
+          if (!nocopy) { dm_guest_write_prepare((void *)src, size); memcpy((void *)src, (void *)dst, size); } }
         map_del(k - 1);
         pthread_mutex_unlock(&g_map_lock);
         regs[0] = 0; return 0;
