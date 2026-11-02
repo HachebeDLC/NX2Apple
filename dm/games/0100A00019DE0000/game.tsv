@@ -39,6 +39,10 @@ mem_stack	0x10000000
 app_pool	0xCD500000
 mem_used	0x6c00000
 
+# ---- Frame rate ----
+# The game steps by real time (Melinoë walks the same distance in a held second at 60 and 120 fps), so it runs above 60 on a 120 Hz screen: 120 is the launcher's default
+present_hz	120
+
 # ---- Widescreen (host only, NOT enabled for this game) ----
 # The swapchain size 1280x720 is hardcoded twice in main: a rodata entry at +0x6d337c ({u32 w,
 # u32 h}, dead data) and two immediate instructions at +0x2a6080 (movz/movk x8) that write it into

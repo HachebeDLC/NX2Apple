@@ -101,6 +101,8 @@ def header(g):
     try: spv = float(sp)
     except ValueError: spv = -1
     if not (spv == 0 or 25 <= spv <= 200): sys.exit(f'{g.id}: screen_percentage must be 0 or 25 to 200: {sp}')
+    ph = g.get('present_hz', '60')   # frame-rate limit of a game that steps by real time (Hades II): 60, or 120 on a 120 Hz screen (hle_nvn.c present_cfg; display pacing, DM_PRESENT_LINK=2)
+    if ph not in ('60', '120'): sys.exit(f'{g.id}: present_hz must be 60 or 120: {ph}')
     dh = g.get('display_height', '0')   # the game's own output size picked from its display mode table (hle_fpslock.c k_res; NARUTO X BORUTO Storm Connections): 0 = the game's own, else 720 / 900 / 1080
     if dh not in ('0', '720', '900', '1080'): sys.exit(f'{g.id}: display_height must be 0, 720, 900 or 1080: {dh}')
     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
@@ -182,6 +184,7 @@ def header(g):
          f'#define DM_GAME_ENC_THREAD {int(et == "on")}',
          f'#define DM_GAME_SCREEN_PERCENTAGE {q(sp)}',
          f'#define DM_GAME_DISPLAY_HEIGHT {int(dh)}',
+         f'#define DM_GAME_PRESENT_HZ {int(ph)}',
          *([f'#define DM_GAME_SHARED_FONT_TTF {int(sf == "ttf")}'] if g.get('shared_font', '') else []),   # without the key the host decides by the SDK version (hle_sdk16.c)
          f'#define DM_GAME_PAD_LAYOUT {("simple", "full", "touch").index(pl)}',
          f'#define DM_GAME_OPMODE {int(om == "console")}',
