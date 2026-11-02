@@ -2108,7 +2108,6 @@ static void note_miss(const char *name) {
     if (g_nmiss < 512) g_miss_name[g_nmiss++] = name;
     if (getenv("DM_GL_MISSES")) GLOG("[RED] eglGetProcAddress(%s): not implemented, the game gets a null pointer", name);
 }
-GLB(glFlush, void, void) { if (g_cb) cb_commit(); }
 GL(glIsSync, uint32_t, void *s) { return s && sync_live(s, 0); }
 // Queries the layer has no data for: their outputs are written (zero / empty), so a caller never reads what was in its buffers before (Scaleform enumerates what it asked for)
 GL(glGetActiveAttrib, void, GLuint p, GLuint i, GLsizei n, GLsizei *len, GLint *size, GLenum *type, GLchar *name) { (void)p; (void)i; if (len) *len = 0; if (size) *size = 0; if (type) *type = 0; if (name && n > 0) name[0] = 0; }
