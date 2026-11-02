@@ -384,7 +384,14 @@ static int host_path_ex(const char *p, char *out, size_t n, int *ro, int create)
     for (int i = 0; i < g_nmnt; i++) {
         if (strlen(g_mnt[i].name) != ln || strncmp(g_mnt[i].name, p, ln)) continue;
         if (ro) *ro = g_mnt[i].ro;
-        char normed[1024]; const char *rest = c + 1;
+        char normed[1024], fwd[1024]; const char *rest = c + 1;
+        // Windows separators: KINGDOM HEARTS -HD 1.5+2.5 ReMIX- (a PC port) builds its save paths as "save:\KINGDOM HEARTS HD 1.5+2.5 ReMIX\KHFM.png" and
+        // "save:\KINGDOM HEARTS HD 1.5+2.5 ReMIX/config1525.dat"; taken literally the first became one file at the save root and the folder of the second never existed
+        if (strchr(rest, '\\')) {
+            if (strlcpy(fwd, rest, sizeof fwd) >= sizeof fwd) { errno = ENAMETOOLONG; return 0; }
+            for (char *q = fwd; *q; q++) if (*q == '\\') *q = '/';
+            rest = fwd;
+        }
         if (strstr(rest, "/.")) { if (!norm_rest(rest, normed, sizeof normed)) return 0; rest = normed; }   // only paths with "." components are normalized; the rest walk component by component as before
         if (g_mnt[i].overlay[0] && !create) return rom_overlay_path(&g_mnt[i], rest, out, n);
         strlcpy(out, g_mnt[i].dir, n);
@@ -1014,6 +1021,21 @@ HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → close
 
 // ---------- Overloads from newer SDKs (SDK 16: MountRom without a cache, ReadFile without the bytes-read output / with read options, directory entry count) ----------
 HLE_FORCE("_ZN2nn2fs8MountRomEPKc", "fsp-srv; rom → host RomFS directory (overload without the cache arguments)", Result, h_fs_MountRom1, const char *name) { return h_fs_MountRom(name, NULL, 0); }
+// The RomFS of another program of a multi-program application (KINGDOM HEARTS -HD 1.5+2.5 ReMIX-: each game mounts the menu's, program 0, as rom0): DM_ROMFS_P<index>,
+// else romfs_p<index>.img beside DM_ROMFS (the app's own RomFS); missing, it answers "target not found"
+HLE_FORCE("_ZN2nn2fs8MountRomEPKciPvm", "fsp-srv; another program's RomFS → DM_ROMFS_P<index> or romfs_p<index>.img beside the game's", Result, h_fs_MountRomProgram, const char *name, int index, void *cache, size_t sz) {
+    (void)cache; (void)sz; char var[32], p[1024], b[1024]; struct stat st;
+    snprintf(var, sizeof var, "DM_ROMFS_P%d", index);
+    if (getenv(var)) strlcpy(p, getenv(var), sizeof p);
+    else {
+        strlcpy(b, envdir("DM_ROMFS", "romfs", p, sizeof p), sizeof b);
+        char *s = strrchr(b, '/'); if (s) *s = 0; else strlcpy(b, ".", sizeof b);
+        snprintf(p, sizeof p, "%s/romfs_p%d.img", b, index);
+    }
+    if (stat(p, &st)) { LOG("[RED] fs MountRom(%s, program %d): %s not found (set %s)", name, index, p, var); return RES_TARGET_NOT_FOUND; }
+    LOG("fs MountRom(%s, program %d) → %s", name, index, p);
+    return mount(name, p, 1);
+}
 // ReadFile without the bytes-read output: the read must be complete; a short read (past the end of file) is returned as a failure
 HLE_FORCE("_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm", "fsp-srv → pread(2), must read in full", Result, h_fs_ReadFileExact, uint64_t h, int64_t off, void *buf, size_t sz) {
     size_t got = 0; Result r = h_fs_ReadFile(&got, h, off, buf, sz);

@@ -218,7 +218,7 @@ struct VkPipeline_T {
     const shinfo *vs, *fs; uint32_t vb_mask; VkPipelineLayout layout;
     MTLPrimitiveType prim; MTLCullMode cull; MTLWinding wind; MTLTriangleFillMode fill; MTLDepthClipMode clip;
     int bias; float bias_c, bias_s, bias_cl; float blend[4]; uint32_t sref_f, sref_b;
-    int dyn_vp, dyn_sc, has_vp, has_sc; MTLViewport vp; VkRect2D sc;
+    int dyn_vp, dyn_sc, dyn_blend, dyn_sref, has_vp, has_sc; MTLViewport vp; VkRect2D sc;
 };
 struct VkCommandPool_T { struct VkCommandBuffer_T *cbs; };
 struct VkCommandBuffer_T { void *loader; VkCommandPool pool; struct VkCommandBuffer_T *prev, *next; uint8_t *buf; size_t n, cap; };
@@ -933,7 +933,8 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
         const VkPipelineDynamicStateCreateInfo *dy = ci->pDynamicState;
         for (uint32_t i = 0; dy && i < dy->dynamicStateCount; i++) {
             VkDynamicState s = dy->pDynamicStates[i];
-            if (s == VK_DYNAMIC_STATE_VIEWPORT) p->dyn_vp = 1; else if (s == VK_DYNAMIC_STATE_SCISSOR) p->dyn_sc = 1; else RED1("dynamic state %d not implemented (the imports have no matching set function)", s);
+            if (s == VK_DYNAMIC_STATE_VIEWPORT) p->dyn_vp = 1; else if (s == VK_DYNAMIC_STATE_SCISSOR) p->dyn_sc = 1;
+            else if (s == VK_DYNAMIC_STATE_BLEND_CONSTANTS) p->dyn_blend = 1; else if (s == VK_DYNAMIC_STATE_STENCIL_REFERENCE) p->dyn_sref = 1; else RED1("dynamic state %d not implemented (the imports have no matching set function)", s);
         }
         const VkPipelineViewportStateCreateInfo *vs = ci->pViewportState;
         if (!p->dyn_vp && vs && vs->pViewports && vs->viewportCount) { p->vp = vp_of(&vs->pViewports[0]); p->has_vp = 1; }
@@ -953,7 +954,7 @@ VKB(vkCreateGraphicsPipelines, VkResult, VkDevice d, VkPipelineCache c, uint32_t
 VKB(vkDestroyPipeline, void, VkDevice d, VkPipeline p, const VkAllocationCallbacks *a) { (void)d; (void)a; if (p) { p->pso = nil; p->dss = nil; free(p); } }
 
 // ---------- Command buffers: recording ----------
-enum { C_BRP = 1, C_ERP, C_PIPE, C_SETS, C_VB, C_IB, C_VP, C_SC, C_DRAWI, C_COPYB, C_COPYB2I, C_DRAW, C_PUSH, C_COPYI, C_COPYI2B, C_QRESET, C_QTS, C_QBEGIN, C_QEND };
+enum { C_BRP = 1, C_ERP, C_PIPE, C_SETS, C_VB, C_IB, C_VP, C_SC, C_DRAWI, C_COPYB, C_COPYB2I, C_DRAW, C_PUSH, C_COPYI, C_COPYI2B, C_QRESET, C_QTS, C_QBEGIN, C_QEND, C_BLEND, C_SREF, C_CLRATT, C_RESOLVE };
 typedef struct { uint32_t op, size; } chdr;
 typedef struct { VkRenderPass rp; VkFramebuffer fb; VkRect2D area; uint32_t nclear; VkClearValue clear[]; } c_brp;
 typedef struct { VkPipeline p; } c_pipe;
@@ -970,6 +971,10 @@ typedef struct { uint32_t off, size; uint8_t data[]; } c_push;
 typedef struct { VkImage src, dst; uint32_t n; VkImageCopy r[]; } c_copyi;
 typedef struct { VkImage src; VkBuffer dst; uint32_t n; VkBufferImageCopy r[]; } c_copyi2b;
 typedef struct { VkQueryPool q; uint32_t first, n; } c_query;
+typedef struct { float c[4]; } c_blend;
+typedef struct { VkStencilFaceFlags face; uint32_t ref; } c_sref;
+typedef struct { uint32_t na, nr; VkClearAttachment a[9]; VkClearRect r[]; } c_clratt;
+typedef struct { VkImage src, dst; uint32_t n; VkImageResolve r[]; } c_resolve;
 static void *rec(VkCommandBuffer cb, uint32_t op, size_t sz) {
     size_t need = (sizeof(chdr) + sz + 7) & ~(size_t)7;
     if (cb->n + need > cb->cap) {
@@ -1053,6 +1058,15 @@ VK(vkCmdCopyImageToBuffer, void, VkCommandBuffer cb, VkImage src, VkImageLayout 
 VK(vkCmdResetQueryPool, void, VkCommandBuffer cb, VkQueryPool q, uint32_t first, uint32_t n) { *(c_query *)rec(cb, C_QRESET, sizeof(c_query)) = (c_query){q, first, n}; }
 VK(vkCmdWriteTimestamp, void, VkCommandBuffer cb, VkPipelineStageFlagBits st, VkQueryPool q, uint32_t i) { (void)st; *(c_query *)rec(cb, C_QTS, sizeof(c_query)) = (c_query){q, i, 1}; }
 VK(vkCmdBeginQuery, void, VkCommandBuffer cb, VkQueryPool q, uint32_t i, VkQueryControlFlags f) { (void)f; *(c_query *)rec(cb, C_QBEGIN, sizeof(c_query)) = (c_query){q, i, 1}; }
+VK(vkCmdSetBlendConstants, void, VkCommandBuffer cb, const float c[4]) { memcpy(((c_blend *)rec(cb, C_BLEND, sizeof(c_blend)))->c, c, 16); }
+VK(vkCmdSetStencilReference, void, VkCommandBuffer cb, VkStencilFaceFlags f, uint32_t ref) { *(c_sref *)rec(cb, C_SREF, sizeof(c_sref)) = (c_sref){f, ref}; }
+VK(vkCmdClearAttachments, void, VkCommandBuffer cb, uint32_t na, const VkClearAttachment *a, uint32_t nr, const VkClearRect *r) {
+    na = umin(na, 9); c_clratt *c = rec(cb, C_CLRATT, sizeof *c + nr * sizeof(VkClearRect)); c->na = na; c->nr = nr;
+    memcpy(c->a, a, na * sizeof *a); memcpy(c->r, r, nr * sizeof *r);
+}
+VK(vkCmdResolveImage, void, VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageResolve *r) {
+    (void)sl; (void)dl; c_resolve *c = rec(cb, C_RESOLVE, sizeof *c + n * sizeof *r); c->src = src; c->dst = dst; c->n = n; memcpy(c->r, r, n * sizeof *r);
+}
 VK(vkCmdEndQuery, void, VkCommandBuffer cb, VkQueryPool q, uint32_t i) { *(c_query *)rec(cb, C_QEND, sizeof(c_query)) = (c_query){q, i, 1}; }
 // Barriers order nothing here: one serial queue, and Metal tracks hazards between the passes and blits it encodes
 VK(vkCmdPipelineBarrier, void, VkCommandBuffer cb, VkPipelineStageFlags s, VkPipelineStageFlags d, VkDependencyFlags f, uint32_t nm, const VkMemoryBarrier *m,
@@ -1072,6 +1086,7 @@ typedef struct {
     VkBuffer vb[14]; VkDeviceSize vbo[14];
     VkBuffer ib; VkDeviceSize ibo; MTLIndexType it; uint32_t isz;
     VkViewport vp; VkRect2D sc; int have_vp, have_sc, vp_dirty, sc_dirty;
+    float blend[4]; uint32_t sref_f, sref_b; int dyn_dirty;   // dynamic blend constants and stencil reference (vkCmdSetBlendConstants / vkCmdSetStencilReference)
     uint8_t pc[256];
     subq_t *sq;
     // The current render pass: its descriptor (attachments created with deferred store actions) and the store actions it ends with; cut = its encoder was ended
@@ -1105,6 +1120,50 @@ static void resume_rp(rs_t *s) {
     if (d.stencilAttachment.texture) d.stencilAttachment.loadAction = MTLLoadActionLoad;
     s->re = [s->cb renderCommandEncoderWithDescriptor:d]; s->cut = 0;
     s->applied = NULL; s->vp_dirty = s->sc_dirty = 1;
+}
+// vkCmdClearAttachments inside a render pass (KINGDOM HEARTS FINAL MIX): Metal clears only at the start of a pass, so the pass is split and resumed with a clear load action on the
+// listed attachments. Exact for rects that cover the render target; a smaller rect would clear the whole attachment, so those are skipped (red line)
+static void clear_att(rs_t *s, const c_clratt *x) {
+    if (!s->re && !s->cut) { RED1("vkCmdClearAttachments outside a render pass"); return; }
+    for (uint32_t i = 0; i < x->nr; i++) {
+        const VkRect2D *r = &x->r[i].rect;
+        if (r->offset.x > 0 || r->offset.y > 0 || r->offset.x + (int64_t)r->extent.width < s->rt_w || r->offset.y + (int64_t)r->extent.height < s->rt_h) {
+            RED1("vkCmdClearAttachments of a part of the target (%d,%d %ux%u of %ux%u) not implemented", r->offset.x, r->offset.y, r->extent.width, r->extent.height, s->rt_w, s->rt_h); return;
+        }
+    }
+    if (s->re) end_rp(s, 0);
+    end_blit(s);
+    MTLRenderPassDescriptor *d = s->rpd;
+    for (int i = 0; i < 8; i++) if (d.colorAttachments[i].texture) d.colorAttachments[i].loadAction = MTLLoadActionLoad;
+    if (d.depthAttachment.texture) d.depthAttachment.loadAction = MTLLoadActionLoad;
+    if (d.stencilAttachment.texture) d.stencilAttachment.loadAction = MTLLoadActionLoad;
+    for (uint32_t i = 0; i < x->na; i++) {
+        const VkClearAttachment *a = &x->a[i];
+        if (a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT && a->colorAttachment < 8 && d.colorAttachments[a->colorAttachment].texture) {
+            const float *f = a->clearValue.color.float32; MTLRenderPassColorAttachmentDescriptor *ca = d.colorAttachments[a->colorAttachment];
+            ca.loadAction = MTLLoadActionClear; ca.clearColor = MTLClearColorMake(f[0], f[1], f[2], f[3]);
+        }
+        if (a->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT && d.depthAttachment.texture) { d.depthAttachment.loadAction = MTLLoadActionClear; d.depthAttachment.clearDepth = a->clearValue.depthStencil.depth; }
+        if (a->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT && d.stencilAttachment.texture) { d.stencilAttachment.loadAction = MTLLoadActionClear; d.stencilAttachment.clearStencil = a->clearValue.depthStencil.stencil; }
+    }
+    s->re = [s->cb renderCommandEncoderWithDescriptor:d]; s->cut = 0;
+    s->applied = NULL; s->vp_dirty = s->sc_dirty = 1;
+}
+// vkCmdResolveImage: a Metal pass with no draws that loads the multisampled image and resolves it into the destination on store (whole image: the regions' offsets are not used)
+static void resolve_img(rs_t *s, const c_resolve *x) {
+    if (!x->src->tex || !x->dst->tex) { RED1("a resolved image was not created"); return; }
+    if (s->re) { end_rp(s, 0); s->cut = 1; }
+    end_blit(s);
+    for (uint32_t i = 0; i < x->n; i++) {
+        const VkImageResolve *r = &x->r[i];
+        if (r->srcOffset.x || r->srcOffset.y || r->dstOffset.x || r->dstOffset.y) RED1("vkCmdResolveImage with offsets not implemented (resolving the whole image)");
+        MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor]; MTLRenderPassColorAttachmentDescriptor *ca = d.colorAttachments[0];
+        ca.texture = x->src->tex; ca.slice = r->srcSubresource.baseArrayLayer; ca.level = r->srcSubresource.mipLevel; ca.loadAction = MTLLoadActionLoad;
+        ca.resolveTexture = x->dst->tex; ca.resolveSlice = r->dstSubresource.baseArrayLayer; ca.resolveLevel = r->dstSubresource.mipLevel;
+        ca.storeAction = x->src->samples > 1 ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore;
+        if (x->src->samples <= 1) { RED1("vkCmdResolveImage of a single-sample image: copied"); id<MTLBlitCommandEncoder> be = [s->cb blitCommandEncoder]; [be copyFromTexture:x->src->tex toTexture:x->dst->tex]; [be endEncoding]; continue; }
+        [[s->cb renderCommandEncoderWithDescriptor:d] endEncoding];
+    }
 }
 static MTLLoadAction load_a(VkAttachmentLoadOp o) { return o == VK_ATTACHMENT_LOAD_OP_CLEAR ? MTLLoadActionClear : o == VK_ATTACHMENT_LOAD_OP_LOAD ? MTLLoadActionLoad : MTLLoadActionDontCare; }
 static MTLStoreAction store_a(VkAttachmentStoreOp o) { return o == VK_ATTACHMENT_STORE_OP_DONT_CARE ? MTLStoreActionDontCare : MTLStoreActionStore; }
@@ -1208,7 +1267,12 @@ static int pre_draw(rs_t *s) {
         [re setStencilFrontReferenceValue:p->sref_f backReferenceValue:p->sref_b];
         if (p->has_vp && (!s->applied || !s->applied->has_vp || memcmp(&s->applied->vp, &p->vp, sizeof p->vp))) s->vp_dirty = 1;
         if (p->has_sc) s->sc_dirty = 1;
-        s->applied = p;
+        s->applied = p; s->dyn_dirty = 1;
+    }
+    if (s->dyn_dirty) {
+        if (p->dyn_blend) [re setBlendColorRed:s->blend[0] green:s->blend[1] blue:s->blend[2] alpha:s->blend[3]];
+        if (p->dyn_sref) [re setStencilFrontReferenceValue:s->sref_f backReferenceValue:s->sref_b];
+        s->dyn_dirty = 0;
     }
     if (s->vp_dirty) {
         MTLViewport v = p->has_vp ? p->vp : vp_of(&s->vp);
@@ -1347,6 +1411,10 @@ static void replay(rs_t *s, VkCommandBuffer cb) {
                 x->q->ticket[x->first] = q->v;
                 break;
             }
+            case C_BLEND: memcpy(s->blend, ((const c_blend *)c)->c, 16); s->dyn_dirty = 1; break;
+            case C_SREF: { const c_sref *x = c; if (x->face & VK_STENCIL_FACE_FRONT_BIT) s->sref_f = x->ref; if (x->face & VK_STENCIL_FACE_BACK_BIT) s->sref_b = x->ref; s->dyn_dirty = 1; break; }
+            case C_CLRATT: clear_att(s, c); break;
+            case C_RESOLVE: resolve_img(s, c); g_n_copy += ((const c_resolve *)c)->n; break;
             case C_QEND: if (s->re) [s->re setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0]; break;
             default: LOG("[vk] [RED] unknown command %u in the command buffer", h->op); return;
         }
