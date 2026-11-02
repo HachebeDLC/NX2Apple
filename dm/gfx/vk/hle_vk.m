@@ -428,8 +428,8 @@ VKB(vkFreeMemory, void, VkDevice d, VkDeviceMemory m, const VkAllocationCallback
 VKB(vkMapMemory, VkResult, VkDevice d, VkDeviceMemory m, VkDeviceSize off, VkDeviceSize size, VkMemoryMapFlags fl, void **pp) {
     (void)d; (void)size; (void)fl;
     if (m->type == 0) RED1("mapped invisible memory (type 0)");
-    id<MTLBuffer> b = mem_buf(m); if (!b) return VK_ERROR_MEMORY_MAP_FAILED;
-    *pp = (uint8_t *)b.contents + off; return VK_SUCCESS;
+    @autoreleasepool { id<MTLBuffer> b = mem_buf(m); if (!b) return VK_ERROR_MEMORY_MAP_FAILED; *pp = (uint8_t *)b.contents + off; }
+    return VK_SUCCESS;
 }
 VK(vkUnmapMemory, void, VkDevice d, VkDeviceMemory m) { (void)d; (void)m; }
 VK(vkFlushMappedMemoryRanges, VkResult, VkDevice d, uint32_t n, const VkMappedMemoryRange *r) { (void)d; (void)n; (void)r; return VK_SUCCESS; }   // shared storage is coherent
@@ -446,7 +446,7 @@ VK(vkGetBufferMemoryRequirements2, void, VkDevice d, const VkBufferMemoryRequire
     h_vkGetBufferMemoryRequirements(d, i->buffer, &r->memoryRequirements); dedicated_req(r->pNext);
 }
 VKB(vkBindBufferMemory, VkResult, VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize off) {
-    (void)d; b->mem = m; b->off = off; return mem_buf(m) ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    (void)d; b->mem = m; b->off = off; @autoreleasepool { return mem_buf(m) ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY; }
 }
 VKB(vkBindBufferMemory2, VkResult, VkDevice d, uint32_t n, const VkBindBufferMemoryInfo *bi) {
     for (uint32_t i = 0; i < n; i++) { VkResult r = h_vkBindBufferMemory(d, bi[i].buffer, bi[i].memory, bi[i].memoryOffset); if (r) return r; }
