@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Go=CC=81mez?= <daniel.gomez@contextual.team>
+Date: Tue, 3 Nov 2026 21:37:45 +0100
+Subject: [PATCH] docs_patches: classify the ScreenPercentage row
+Reason: the patch queue page must classify every build-keyed host row; patch 0061 adds the r.ScreenPercentage row
+Issue: HachebeDLC/NX2Apple#1
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: TODO: why the fork carries this
+Issue: TODO: LNPANDY/NX2Apple#<n>
+
+---
+ dm/tools/docs_patches.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/dm/tools/docs_patches.py b/dm/tools/docs_patches.py
+index 56aa279..c6ed17d 100644
+--- a/dm/tools/docs_patches.py
++++ b/dm/tools/docs_patches.py
+@@ -84,6 +84,8 @@ HOST_BINDING = [
+      'why': "the engine's own 60 fps mode: SetFrameRate stores 60 / fps and the vsync thread signals the frame event every that many vsyncs; the byte at +0xa02 and the two vsync fields are what the game reads back"}),
+     ('k_locks', 'CC2 vsyncs per frame', 'd9c42d45d9850c5804749ed9b44198bf', {'what': "the three STORM CONNECTIONS rows together", 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+      'why': "one classification covers the table's three rows (the frame rate byte and the two vsync counters of the display object)"}),
++    ('k_cvars', 'Unreal r.ScreenPercentage', '', {'what': "Unreal's r.ScreenPercentage console variable set from the profile (DRAGON BALL Sparking! ZERO)", 'now': 'build', 'goal': 'engine', 'purpose': 'resolution',
++     'why': "the rewriter's console variables (ue_cvar.py) can find t.MaxFPS in any build; r.ScreenPercentage is registered the same way, so this row can move to the same discovery"}),
+     ('k_res', '', '', {'what': "the game's display-mode rows rewritten for the profile's display_height (STORM CONNECTIONS)", 'now': 'build', 'goal': 'game', 'purpose': 'resolution',
+      'why': "the game picks its output size from its own mode table; the host rewrites two rows so 900 / 1080 exist"}),
+     ('k_ue', '', 'feae83dc9e9fb34c77d0a62f1fa9ae9f', {'what': "UE3's GMalloc setup skipped, the host allocator in (hle_uemalloc.c)", 'now': 'build', 'goal': 'game', 'purpose': 'address space',
