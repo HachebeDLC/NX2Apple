@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Go=CC=81mez?= <daniel.gomez@contextual.team>
+Date: Tue, 3 Nov 2026 21:42:51 +0100
+Subject: [PATCH] docs_patches: the remaining bindings of patch 0061's rows and
+ keys
+Reason: the patch queue page requires every build-keyed row, switch and patch file to carry a binding; patch 0061 adds several
+Issue: HachebeDLC/NX2Apple#1
+Reason: the patch queue page requires every build-keyed row, switch and patch file to carry a binding; patch 0061 adds several (SpNet's SSL context, the Hades II profile's CUTS, and the three profile keys)
+Issue: HachebeDLC/NX2Apple#1
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: TODO: why the fork carries this
+Issue: TODO: LNPANDY/NX2Apple#<n>
+
+---
+ dm/games/0100A00019DE0000/patches.py |  5 +++++
+ dm/tools/docs_patches.py             | 10 +++++++++-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/dm/games/0100A00019DE0000/patches.py b/dm/games/0100A00019DE0000/patches.py
+index aadf589..5cb75ac 100644
+--- a/dm/games/0100A00019DE0000/patches.py
++++ b/dm/games/0100A00019DE0000/patches.py
+@@ -9,3 +9,8 @@ CUTS = {
+     (0x2a5924, '085ac0f2', '0887c0f2', 'screen size: movk x8,#0x2d0,lsl #32 (720) → movk x8,#0x438,lsl #32 (1080)'),
+   ],
+ }
++
++BINDING = [
++    {'what': 'swapchain / screen size 1280x720 → 1920x1080: the two constants rewritten', 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++     'why': "the game lays out in a 1920x1080 design space and scales to it, so the native output needs only these two words; checked on the Mac through the title, the Crossroads and a run in Erebus"},
++]
+diff --git a/dm/tools/docs_patches.py b/dm/tools/docs_patches.py
+index c6ed17d..703e741 100644
+--- a/dm/tools/docs_patches.py
++++ b/dm/tools/docs_patches.py
+@@ -84,7 +84,9 @@ HOST_BINDING = [
+      'why': "the engine's own 60 fps mode: SetFrameRate stores 60 / fps and the vsync thread signals the frame event every that many vsyncs; the byte at +0xa02 and the two vsync fields are what the game reads back"}),
+     ('k_locks', 'CC2 vsyncs per frame', 'd9c42d45d9850c5804749ed9b44198bf', {'what': "the three STORM CONNECTIONS rows together", 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+      'why': "one classification covers the table's three rows (the frame rate byte and the two vsync counters of the display object)"}),
+-    ('k_cvars', 'Unreal r.ScreenPercentage', '', {'what': "Unreal's r.ScreenPercentage console variable set from the profile (DRAGON BALL Sparking! ZERO)", 'now': 'build', 'goal': 'engine', 'purpose': 'resolution',
++    ('', '', '7b53433fa04477fc8a540bd80d5ce665', {'what': "SpNet's SSL context created and destroyed once (no session), keyed to the build (hle_net.c)", 'now': 'build', 'goal': 'engine', 'purpose': 'networking',
++     'why': "the game panics when its startup SSL context cannot be made; the SSL service itself stays cut, and the rewriter's function-level discovery cannot know a game's startup order"}),
++    ('k_cvars', '', '7b53433fa04477fc8a540bd80d5ce665', {'what': "Unreal's r.ScreenPercentage console variable set from the profile (DRAGON BALL Sparking! ZERO)", 'now': 'build', 'goal': 'engine', 'purpose': 'resolution',
+      'why': "the rewriter's console variables (ue_cvar.py) can find t.MaxFPS in any build; r.ScreenPercentage is registered the same way, so this row can move to the same discovery"}),
+     ('k_res', '', '', {'what': "the game's display-mode rows rewritten for the profile's display_height (STORM CONNECTIONS)", 'now': 'build', 'goal': 'game', 'purpose': 'resolution',
+      'why': "the game picks its output size from its own mode table; the host rewrites two rows so 900 / 1080 exist"}),
+@@ -117,6 +119,12 @@ SWITCH_BINDING = [
+      'why': 'as tex_flush_upload, for pools the CPU writes without a flush'}),
+     ('tex_dyn_slots', '', {'what': "buffer-texture handles indexed through c2's tables", 'now': 'game', 'goal': 'host', 'purpose': 'shaders',
+      'why': "right only where the handle comes from c2's tables: the translator could prove that per shader"}),
++    ('present_hz', '', {'what': 'the present rate a game that steps by real time runs at (Hades II: 120)', 'now': 'game', 'goal': 'host', 'purpose': 'frame rate',
++     'why': "display pacing of the host, not the game's own limiter; the value is the screen's"}),
++    ('display_height', '', {'what': "the game's output height picked from its display mode table (STORM CONNECTIONS)", 'now': 'game', 'goal': 'host', 'purpose': 'rendering',
++     'why': 'a launcher setting must not rewrite game tables per build in the host: the key names the row and hle_fpslock.c applies it'}),
++    ('screen_percentage', '', {'what': "Unreal's r.ScreenPercentage the host sets (DRAGON BALL Sparking! ZERO)", 'now': 'game', 'goal': 'engine', 'purpose': 'rendering',
++     'why': 'the engine variable found by name would carry it: the key feeds the same value the device profile sets'}),
+     ('feedback_snap', '', {'what': 'draws that sample their own colour attachment read a snapshot', 'now': 'game', 'goal': 'host', 'purpose': 'rendering',
+      'why': 'the replay could find such draws itself, at the cost of a pass split each'}),
+     ('enc_thread', '', {'what': 'Metal encoding on its own thread on the Mac', 'now': 'game', 'goal': 'host', 'purpose': 'frame rate',
