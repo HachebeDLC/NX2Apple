@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Go=CC=81mez?= <daniel.gomez@contextual.team>
+Date: Wed, 4 Nov 2026 07:24:26 +0100
+Subject: [PATCH] ue_malloc: find the allocator in mains with no unwind entries
+ here, and the duplicated GMalloc setup
+Reason: the finder gave up on DRAGON BALL Sparking! ZERO's main (no unwind entries over the vtable store), its allocator ran uncut and the game crashed on its first 256 KB Malloc; also cuts both call sites of the duplicated GMalloc setup
+Issue: HachebeDLC/NX2Apple#1
+
+The finder gave up when the candidate function start and the vtable store had a
+RET between them (DRAGON BALL Sparking! ZERO 2.0.73: 34.68 MB analysed in 146
+pieces, no unwind entries over the store). It now falls back to the instruction
+block after the last RET before the store; the single-store and call-count
+checks still select the constructor. Its constructor can also have two call
+sites (the two GCreateMalloc copies 0x518 apart): both are cut, and the host's
+OBS_UE_MALLOC gate takes the object from the first that runs.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: TODO: why the fork carries this
+Issue: TODO: LNPANDY/NX2Apple#<n>
+
+---
+ dm/tools/patch_nso.py | 10 ++++++----
+ dm/tools/ue_malloc.py | 16 +++++++++++++---
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/dm/tools/patch_nso.py b/dm/tools/patch_nso.py
+index cbae949..7736522 100644
+--- a/dm/tools/patch_nso.py
++++ b/dm/tools/patch_nso.py
+@@ -158,10 +158,12 @@ for w in ue_cvar_why:
+ # Its constructor reserves 37 GB of address space for its pools. Its one call is cut, and observation gate OBS_UE_MALLOC goes on it (below), where x0 holds the object: the host gives
+ # the object its own allocator's vtable there (dm/host/hle_uemalloc.c), whose place and slot layout the fixups table names (UE_MALLOC_VT, UE_MALLOC_SLOT)
+ import ue_malloc
+-UE_CALL, UE_VT, UE_SLOT, ue_why = ue_malloc.find(bytes(IMG), TEXT_END, RO_OFF, DATA_OFF)
+-if UE_CALL is not None:
+-    cuts.append((UE_CALL, bytes(IMG[UE_CALL:UE_CALL + 4]).hex(), struct.pack('<I', NOP).hex(), f'{ue_why}: the constructor call → nop, gate OBS_UE_MALLOC on it (ue_malloc.py)'))
+-    struct.pack_into('<I', IMG, UE_CALL, NOP)
++UE_CALLS, UE_VT, UE_SLOT, ue_why = ue_malloc.find(bytes(IMG), TEXT_END, RO_OFF, DATA_OFF)
++UE_CALL = UE_CALLS[0] if UE_CALLS else None   # the gate's site: of the duplicated GMalloc setups, the first that runs (DRAGON BALL Sparking! ZERO: 0x1dd0030 and 0x1dd0548)
++if UE_CALLS:
++    for _c in UE_CALLS:
++        cuts.append((_c, bytes(IMG[_c:_c + 4]).hex(), struct.pack('<I', NOP).hex(), f'{ue_why}: the constructor call → nop, gate OBS_UE_MALLOC on the first (ue_malloc.py)'))
++        struct.pack_into('<I', IMG, _c, NOP)
+     print(f'{NAME}: {ue_why}')
+ elif ue_why.startswith('[RED] '): print(f'[RED] {NAME}: {ue_why[6:]}: Unreal\'s own allocator runs')
+ 
+diff --git a/dm/tools/ue_malloc.py b/dm/tools/ue_malloc.py
+index a4fe11f..d24d4f5 100644
+--- a/dm/tools/ue_malloc.py
++++ b/dm/tools/ue_malloc.py
+@@ -87,12 +87,22 @@ def find(img, text_end, ro_off, data_off):
+         if not any(is_adrp(word(p), n) and adrp_page(word(p), p) == vt & ~0xFFF for p in range(max(0, a - 32), a, 4)): continue
+         if not any((word(q) & 0xFFFFFC1F) == 0xF9000000 | d for q in range(a + 4, min(text_end, a + 48), 4)): continue   # str xD, [xM]
+         start = max((t for t in list(bl) + list(b) + list(dtors) if t <= a), default=None)
+-        if start is None or any(word(q) == RET for q in range(start, a, 4)): return None, None, None, f'[RED] FMallocBinned3 vtable at {vt:#x}: no function start for its store at {a:#x}'
++        # A main with no unwind entries in this range names no start here (DRAGON BALL Sparking! ZERO 2.0.73: 34.68 MB in 146 pieces, a RET between the
++        # candidate start and the store). The store still has exactly one caller when it is a constructor's vtable store: fall back to the instruction
++        # block after the last RET before the store, and let the one-call check below reject a store that is not one.
++        if start is None or any(word(q) == RET for q in range(start, a, 4)):
++            r = max((q for q in range(max(0, start or 0), a, 4) if word(q) == RET), default=None)
++            if r is None: return None, None, None, f'[RED] FMallocBinned3 vtable at {vt:#x}: no function start for its store at {a:#x}'
++            start = r + 4
+         if start not in dtors: ctors.add(start)
+     if len(ctors) != 1: return None, None, None, f'[RED] FMallocBinned3 vtable at {vt:#x}: {len(ctors)} constructors (' + ', '.join(f'{x:#x}' for x in sorted(ctors)) + ')'
+     c = ctors.pop()
+-    if len(bl.get(c, [])) != 1 or b.get(c): return None, None, None, f'[RED] FMallocBinned3 constructor at {c:#x}: {len(bl.get(c, []))} calls and {len(b.get(c, []))} jumps, not one call'
+-    return bl[c][0], vt, slot, f'FMallocBinned3 ({LAYOUTS[slot]}): its constructor at {c:#x}, called at {bl[c][0]:#x}; its vtable {vt:#x}, the name getter slot {slot}'
++    # One call site, or the duplicated GMalloc setup (DRAGON BALL Sparking! ZERO 2.0.73: two GCreateMalloc copies 0x518 apart, both constructing the allocator; both cut,
++    # the host's gate takes the object from the first that runs). Anything else stays rejected
++    calls = bl.get(c, [])
++    if b.get(c) or not calls or (len(calls) != 1 and not (len(calls) == 2 and 0 < calls[1] - calls[0] <= 0x600)):
++        return None, None, None, f'[RED] FMallocBinned3 constructor at {c:#x}: {len(calls)} calls and {len(b.get(c, []))} jumps, not one (or the two duplicated setups)'
++    return calls, vt, slot, f'FMallocBinned3 ({LAYOUTS[slot]}): its constructor at {c:#x}, called at {", ".join(f"{x:#x}" for x in calls)}; its vtable {vt:#x}, the name getter slot {slot}'
+ 
+ if __name__ == '__main__':
+     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
