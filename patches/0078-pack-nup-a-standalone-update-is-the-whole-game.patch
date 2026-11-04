@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20G=C3=B3mez?=
+ <26456472+HachebeDLC@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 18:30:29 +0100
+Subject: [PATCH] pack_nup: a standalone update is the whole game
+
+A NUP may hold a game as one update package flagged STANDALONE ("an update in a
+container without a base") with no base package at all: Donkey Kong Bananza
+v458752 and Mario Kart World v917504 come that way, their updates carrying the
+complete ExeFS and RomFS. scan() refused them ("no base game"). It now takes
+an empty placeholder base, as for a dump whose update holds the whole game
+(Pokemon Pokopia's v655360), and the update's own ExeFS and RomFS run.
+Donkey Kong Bananza then builds and runs on the Mac (75 s, no red lines).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: NUPs that hold the whole game as one STANDALONE update with no base package (Donkey Kong Bananza v458752, Mario Kart World v917504) were refused as 'no base game'
+Issue: HachebeDLC/NX2Apple#1
+
+---
+ scripts/pack_nup.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/pack_nup.py b/scripts/pack_nup.py
+index 59a378f..2986c2a 100644
+--- a/scripts/pack_nup.py
++++ b/scripts/pack_nup.py
+@@ -14,7 +14,7 @@
+ # Every file read is checked against its SHA-256. A repeat run keeps code modules whose content is the same and an image made from the same container tree by the same packer.
+ # Needs the zstd module: compression.zstd (Python 3.14+) or backports.zstd, as the NSP script.
+ # Usage: pack_nup.py <game.nup> [--version N] [--work-dir DIR]   (exit 1 on error)
+-import argparse, hashlib, mmap, os, shutil, struct, sys
++import argparse, hashlib, mmap, os, shutil, struct, sys, types
+ from pathlib import Path
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'dm/tools'))
+ import romfs_image
+@@ -175,6 +175,11 @@ def is_nup(path):
+ def scan(n):
+     """What a NUP holds: (title ID, base package, {update version: package}, {DLC title ID: package}), with the checks pack_dump.scan makes"""
+     bases = [k for k in n.packages if k.kind == BASE]
++    if not bases and any(k.kind == UPDATE and k.flags & STANDALONE and k.exefs != NO_DIR for k in n.packages):
++        # A container of a standalone update (package flag STANDALONE) holds the whole game in that update: the base is then an empty placeholder, as a dump's
++        # (Pokemon Pokopia's v655360), and the update's own ExeFS and RomFS are what runs
++        bases = [types.SimpleNamespace(nup=n, index=-1, title_id=0, root=NO_DIR, exefs=NO_DIR, romfs=NO_DIR, version=0, kind=BASE, flags=0, meta_off=0, meta_size=0,
++                                       name=f'{n.path.name} (no base: standalone update)', meta=lambda: {})]
+     if not bases:
+         raise Error(f'{n.path}: no base game, only ' + (', '.join(sorted({KINDS[k.kind] for k in n.packages}))) + ' packages: pack the base game and its update into one NUP')
+     base = bases[0]
