@@ -44,3 +44,4 @@
 0066-docs-patches-the-remaining-bindings-of-patch-006.patch
 0067-ue-malloc-find-the-allocator-in-mains-with-no-un.patch
 0068-ue-malloc-diagnostics-the-find-inputs-in-the-fai.patch
+0069-ue-malloc-dump-the-call-state-under-dm-ue-debug.patch

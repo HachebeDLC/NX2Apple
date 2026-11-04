@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Go=CC=81mez?= <daniel.gomez@contextual.team>
+Date: Wed, 4 Nov 2026 08:36:35 +0100
+Subject: [PATCH] ue_malloc: dump the call state under DM_UE_DEBUG
+Reason: a diagnostic dump of the allocator finder under DM_UE_DEBUG
+Issue: HachebeDLC/NX2Apple#1
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: TODO: why the fork carries this
+Issue: TODO: LNPANDY/NX2Apple#<n>
+
+---
+ dm/tools/ue_malloc.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/dm/tools/ue_malloc.py b/dm/tools/ue_malloc.py
+index d24d4f5..9769434 100644
+--- a/dm/tools/ue_malloc.py
++++ b/dm/tools/ue_malloc.py
+@@ -100,6 +100,8 @@ def find(img, text_end, ro_off, data_off):
+     # One call site, or the duplicated GMalloc setup (DRAGON BALL Sparking! ZERO 2.0.73: two GCreateMalloc copies 0x518 apart, both constructing the allocator; both cut,
+     # the host's gate takes the object from the first that runs). Anything else stays rejected
+     calls = bl.get(c, [])
++    if os.environ.get('DM_UE_DEBUG'):
++        with open(os.environ['DM_UE_DEBUG'], 'a') as f: f.write(f'ctor {c:#x} calls {[f"{x:#x}" for x in calls]} jumps {len(b.get(c, []))} imglen {len(img):#x} text_end {text_end:#x}\n')
+     if b.get(c) or not calls or (len(calls) != 1 and not (len(calls) == 2 and 0 < calls[1] - calls[0] <= 0x600)):
+         return None, None, None, f'[RED] FMallocBinned3 constructor at {c:#x}: {len(calls)} calls and {len(b.get(c, []))} jumps, not one (or the two duplicated setups)'
+     return calls, vt, slot, f'FMallocBinned3 ({LAYOUTS[slot]}): its constructor at {c:#x}, called at {", ".join(f"{x:#x}" for x in calls)}; its vtable {vt:#x}, the name getter slot {slot}'
