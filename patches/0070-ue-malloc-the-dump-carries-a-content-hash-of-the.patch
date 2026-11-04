@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Go=CC=81mez?= <daniel.gomez@contextual.team>
+Date: Wed, 4 Nov 2026 09:05:14 +0100
+Subject: [PATCH] ue_malloc: the dump carries a content hash of the scanned
+ text
+Reason: a diagnostic hash of the scanned text in the allocator-finder dump (how the stale-profile mystery was closed)
+Issue: HachebeDLC/NX2Apple#1
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: TODO: why the fork carries this
+Issue: TODO: LNPANDY/NX2Apple#<n>
+
+---
+ dm/tools/ue_malloc.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/dm/tools/ue_malloc.py b/dm/tools/ue_malloc.py
+index 9769434..9f3e8a9 100644
+--- a/dm/tools/ue_malloc.py
++++ b/dm/tools/ue_malloc.py
+@@ -18,6 +18,7 @@ import re, struct, sys, os
+ LAYOUTS = {19: 'Unreal Engine 4.26 / 4.27', 22: 'Unreal Engine 5', 26: 'Unreal Engine 5.6'}   # the getter's slot → the slot layouts of hle_uemalloc.c
+ NAME = 'Binned3'.encode('utf-16-le') + b'\0\0'
+ RET, NOP = 0xD65F03C0, 0xD503201F
++if os.environ.get('DM_UE_DEBUG'): open(os.environ['DM_UE_DEBUG'],'a').write(f'loaded {__file__}\n')
+ 
+ def relocated(img):
+     """{offset: value} of the image's relative relocations (RELA R_AARCH64_RELATIVE and RELR, whose addend is in place); a word not in it holds its value in place"""
+@@ -101,7 +102,7 @@ def find(img, text_end, ro_off, data_off):
+     # the host's gate takes the object from the first that runs). Anything else stays rejected
+     calls = bl.get(c, [])
+     if os.environ.get('DM_UE_DEBUG'):
+-        with open(os.environ['DM_UE_DEBUG'], 'a') as f: f.write(f'ctor {c:#x} calls {[f"{x:#x}" for x in calls]} jumps {len(b.get(c, []))} imglen {len(img):#x} text_end {text_end:#x}\n')
++        with open(os.environ['DM_UE_DEBUG'], 'a') as f: import hashlib; f.write(f'ctor {c:#x} calls {[f"{x:#x}" for x in calls]} jumps {len(b.get(c, []))} imglen {len(img):#x} text_end {text_end:#x} hash {hashlib.md5(img[:text_end]).hexdigest()[:12]}\n')
+     if b.get(c) or not calls or (len(calls) != 1 and not (len(calls) == 2 and 0 < calls[1] - calls[0] <= 0x600)):
+         return None, None, None, f'[RED] FMallocBinned3 constructor at {c:#x}: {len(calls)} calls and {len(b.get(c, []))} jumps, not one (or the two duplicated setups)'
+     return calls, vt, slot, f'FMallocBinned3 ({LAYOUTS[slot]}): its constructor at {c:#x}, called at {", ".join(f"{x:#x}" for x in calls)}; its vtable {vt:#x}, the name getter slot {slot}'
