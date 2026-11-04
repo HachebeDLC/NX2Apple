@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Go=CC=81mez?= <daniel.gomez@contextual.team>
+Date: Wed, 4 Nov 2026 07:43:57 +0100
+Subject: [PATCH] ue_malloc diagnostics: the find inputs in the failure line
+Reason: a diagnostic line naming the find() inputs when the allocator finder fails
+Issue: HachebeDLC/NX2Apple#1
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: TODO: why the fork carries this
+Issue: TODO: LNPANDY/NX2Apple#<n>
+
+---
+ dm/tools/patch_nso.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dm/tools/patch_nso.py b/dm/tools/patch_nso.py
+index 7736522..3eb4705 100644
+--- a/dm/tools/patch_nso.py
++++ b/dm/tools/patch_nso.py
+@@ -165,7 +165,7 @@ if UE_CALLS:
+         cuts.append((_c, bytes(IMG[_c:_c + 4]).hex(), struct.pack('<I', NOP).hex(), f'{ue_why}: the constructor call → nop, gate OBS_UE_MALLOC on the first (ue_malloc.py)'))
+         struct.pack_into('<I', IMG, _c, NOP)
+     print(f'{NAME}: {ue_why}')
+-elif ue_why.startswith('[RED] '): print(f'[RED] {NAME}: {ue_why[6:]}: Unreal\'s own allocator runs')
++elif ue_why.startswith('[RED] '): print(f'[RED] {NAME}: {ue_why[6:]}: Unreal\'s own allocator runs (text_end {TEXT_END:#x}, ro {RO_OFF:#x}, data {DATA_OFF:#x}, img {len(IMG):#x})')
+ 
+ # ---- Unreal's engine address region (main: dm/tools/ue_region.py finds the store of its size right before nninitStartup reserves it, without a build ID) ----
+ # Observation gate OBS_UE_REGION goes on that store (below), the size register in the gate number's upper bits: the host gives the region what the alias region has room for there
