@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20G=C3=B3mez?=
+ <26456472+HachebeDLC@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 15:46:41 +0100
+Subject: [PATCH] Host: the services and sockets The Legend of Zelda: Ocarina
+ of Time (Switch 2) needs to boot
+
+- hle_sf.c serves auddmg:u (the audio device manager the SDK 22 sound setup connects to;
+  refused, the game aborted with Result 0xa99) and answers CMIF Close messages.
+- hle_audio.c answers nn::audio::detail::ListVirtualInputDevices with 0 devices: the SDK
+  otherwise read a null name list from auddmg's zeroed reply.
+- hle_net.c: EventFd / EventFdRead / EventFdWrite succeed with numbers from 0x4000 up, and
+  Poll treats those as nothing to wait on. gRPC (the npln online library) needs a wakeup fd
+  for its poll engine (without one main+0x21f0c7c aborted: no event engine), and a -1 from
+  Poll made its completion queue return TIMEOUT, which the dispatcher thread dereferenced.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: The Legend of Zelda: Ocarina of Time (Switch 2) aborted in its sound and online setup on the host: auddmg:u, the virtual input device list, gRPC's wakeup fd and poll
+Issue: HachebeDLC/NX2Apple#1
+
+---
+ dm/host/hle_audio.c |  3 +++
+ dm/host/hle_net.c   | 14 ++++++++++----
+ dm/host/hle_sf.c    |  3 ++-
+ 3 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/dm/host/hle_audio.c b/dm/host/hle_audio.c
+index fffd02b..4ab21f9 100644
+--- a/dm/host/hle_audio.c
++++ b/dm/host/hle_audio.c
+@@ -563,6 +563,9 @@ HLE_FORCE("_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE", "get a play
+ // Audio input (a microphone): the host has none. SDL3's Switch audio driver lists the input devices when its audio starts (Absolum); the SDK's versions reach the audin service.
+ // No device is listed and an open fails, so the calls that need an open AudioIn are never reached; they still answer without touching the guest object, in case a game ignores the open's result.
+ // The buffer descriptor functions (SetAudioInBufferInfo, GetAudioInBufferDataPointer / Size) only fill and read the game's own struct and run in the sdk
++// The Legend of Zelda: Ocarina of Time (Switch 2) lists the virtual input devices (SDK 22) in its sound setup: the SDK asks the audio device manager service (auddmg:u), which the host
++// answers with zeroed output, and the SDK then dereferenced a null name list. The host has no microphone: 0 devices
++HLE_FORCE("_ZN2nn5audio6detail23ListVirtualInputDevicesEPNS0_15AudioDeviceNameEi", "virtual audio input device list; the host has no microphone: 0 entries", int, h_ai_ListVirtual, void *names, int n) { (void)names; (void)n; return 0; }
+ HLE_FORCE("_ZN2nn5audio12ListAudioInsEPNS0_11AudioInInfoEi", "audio input device list; the host has no microphone: 0 entries", int, h_ai_List, void *info, int n) { (void)info; (void)n; return 0; }
+ static Result ai_open(const char *name, void *lr) {
+     static _Atomic int once; char sb[64];
+diff --git a/dm/host/hle_net.c b/dm/host/hle_net.c
+index 5074f7a..6080bec 100644
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -43,9 +43,10 @@ static int sk_fail(void) { t_skerr = SK_ENETDOWN; return -1; }
+ void dm_guest_sleep_ns(int64_t ns);
+ static int sk_idle(int64_t ms) { dm_guest_sleep_ns((ms < 0 ? 100 : ms) * 1000000); return 0; }
+ typedef struct { int32_t fd; int16_t events, revents; } sk_pollfd;
++#define SK_EFD_BASE 0x4000   // event fd numbers (EventFd below) start here, above the SDK socket layer's small ones
+ int dm_sk_poll(void *fds, uint64_t n, int ms) {   // also hle_offline.c's plain pollfd form
+     sk_pollfd *p = fds;
+-    for (uint64_t i = 0; i < n; i++) if (p[i].fd >= 0) return sk_fail();
++    for (uint64_t i = 0; i < n; i++) if (p[i].fd >= 0 && p[i].fd < SK_EFD_BASE) return sk_fail();   // event fds (EventFd below) are nothing to wait on: gRPC polls its wakeup fd
+     for (uint64_t i = 0; i < n; i++) p[i].revents = 0;
+     return sk_idle(ms);
+ }
+@@ -67,9 +68,13 @@ SKF("_ZN2nn6socket10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj", h_sk_SetSockOpt, i
+ SKF("_ZN2nn6socket5FcntlEiNS0_12FcntlCommandEz", h_sk_Fcntl, int s, int c) { (void)s; (void)c; return sk_fail(); }
+ SKF("_ZN2nn6socket4PollEPNS0_6PollFdEmi", h_sk_Poll, void *f, unsigned long n, int t) { return dm_sk_poll(f, n, t); }
+ SKF("_ZN2nn6socket6SelectEiPNS0_5FdSetES2_S2_PNS0_7TimeValE", h_sk_Select, int n, void *r, void *w, void *e, void *t) { return dm_sk_select(n, r, w, e, t); }
+-SKF("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", h_sk_EventFd, unsigned long v, int f) { (void)v; (void)f; return sk_fail(); }
+-SKF("_ZN2nn6socket11EventFdReadEiPm", h_sk_EventFdRead, int s, unsigned long *v) { (void)s; (void)v; return sk_fail(); }
+-SKF("_ZN2nn6socket12EventFdWriteEim", h_sk_EventFdWrite, int s, unsigned long v) { (void)s; (void)v; return sk_fail(); }
++// Event fds succeed: The Legend of Zelda: Ocarina of Time (Switch 2) starts gRPC (its npln online library) at boot, and gRPC's poll engine needs a wakeup fd, which the Switch
++// port makes with nn::socket::EventFd; when it failed no poll engine initialised and the game aborted (main+0x21f0c7c, "no event engine"). The fd is a number nothing holds, above the
++// small ones, a read returns one event and a write succeeds; Poll above still finds nothing to wait on, so gRPC idles and the game takes its offline path
++static _Atomic int g_efd_next = SK_EFD_BASE;
++HLE_FORCE("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", "offline: an event fd number for a wakeup fd, held by nothing", int, h_sk_EventFd, unsigned long v, int f) { (void)v; (void)f; return atomic_fetch_add(&g_efd_next, 1); }
++HLE_FORCE("_ZN2nn6socket11EventFdReadEiPm", "offline: an event fd read (one event)", int, h_sk_EventFdRead, int s, unsigned long *v) { (void)s; if (v) *v = 1; return 0; }
++HLE_FORCE("_ZN2nn6socket12EventFdWriteEim", "offline: an event fd write", int, h_sk_EventFdWrite, int s, unsigned long v) { (void)s; (void)v; return 0; }
+ SKF("_ZN2nn6socket17ResolverGetOptionEPNS0_14ResolverOptionENS0_17ResolverOptionKeyE", h_sk_ResGet, void *o, int k) { (void)o; (void)k; return sk_fail(); }
+ SKF("_ZN2nn6socket17ResolverSetOptionERKNS0_14ResolverOptionE", h_sk_ResSet, const void *o) { (void)o; return sk_fail(); }
+ HLE_FORCE("_ZN2nn6socket4RecvEiPvmNS0_7MsgFlagE", "bsd socket service (cut)", long, h_sk_Recv, int s, void *b, unsigned long n, int f) { (void)s; (void)b; (void)n; (void)f; return sk_fail(); }
+@@ -138,3 +143,4 @@ SSC("nnsslConnectionSetNextAlpnProto", h_nssl_SetAlpn) SSC("nnsslConnectionSetOp
+ SSC("nnsslConnectionSetSessionCacheMode", h_nssl_SetCache) SSC("nnsslConnectionSetSocketDescriptor", h_nssl_SetSock)
+ SSC("nnsslConnectionSetVerifyOption", h_nssl_SetVerify) SSC("nnsslConnectionWrite", h_nssl_Write)
+ SSC("nnsslContextDestroy", h_nssl_CtxDestroy) SSC("nnsslContextGetContextId", h_nssl_CtxGetId)
++
+diff --git a/dm/host/hle_sf.c b/dm/host/hle_sf.c
+index f84b5a1..db813cc 100644
+--- a/dm/host/hle_sf.c
++++ b/dm/host/hle_sf.c
+@@ -15,7 +15,7 @@
+ #define SF_MAX 64
+ static struct { char name[16]; int used, domain; unsigned seen; } g_sf[SF_MAX];
+ static pthread_mutex_t g_sf_mu = PTHREAD_MUTEX_INITIALIZER;
+-static const char *const sf_served[] = {"olsc:u"};
++static const char *const sf_served[] = {"olsc:u", "auddmg:u"};   // auddmg:u: The Legend of Zelda: Ocarina of Time (Switch 2) connects to it in its sound setup and aborts (Result 0xa99) when sm refuses it
+ 
+ static int sf_slot(uint32_t h) {
+     unsigned i = h - SF_H0;
+@@ -81,6 +81,7 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request
+     uint32_t magic = *(uint32_t *)(base + hin), ver = *(uint32_t *)(base + hin + 4), cmd = *(uint32_t *)(base + hin + 8);
+     static int trace = -1; if (trace < 0) trace = getenv("DM_SF_TRACE") && atoi(getenv("DM_SF_TRACE"));
+     if (trace) { char hx[3 * 0x80 + 1] = ""; for (unsigned k = 0; k < 0x80 && k < size; k++) snprintf(hx + 3 * k, 4, "%02x ", base[k]); LOG("sf: %s request: %s", g_sf[i].name, hx); }
++    if (type == 2) { memset(base, 0, 16); return RES_OK; }   // Close (CMIF), before CloseClientSessionHandle frees the session (auddmg:u in Ocarina of Time's sound setup)
+     if (type != 4 && type != 6) { LOG("[RED] sf: %s: HIPC message type %u not served", g_sf[i].name, type); return 0xe401u; }
+     if (dtype == 2) { memset(base, 0, 16); return RES_OK; }   // a domain object closed: nothing to answer
+     if (magic != 0x49434653) { LOG("[RED] sf: %s: request without SFCI (%#x)", g_sf[i].name, magic); return 0xe401u; }
