@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Go=CC=81mez?=
+ <26456472+HachebeDLC@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 21:31:17 +0100
+Subject: [PATCH] docs_patches: classify the Sparking Zero FixedFrameRate row
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: the patch queue's own page must classify every build-keyed host row; our patch 0071 adds one more (DRAGON BALL Sparking! ZERO's FixedFrameRate)
+Issue: HachebeDLC/NX2Apple#1
+---
+ dm/tools/docs_patches.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/dm/tools/docs_patches.py b/dm/tools/docs_patches.py
+index fe2c1d01..2f073661 100644
+--- a/dm/tools/docs_patches.py
++++ b/dm/tools/docs_patches.py
+@@ -78,6 +78,8 @@ HOST_BINDING = [
+      'why': "the studio's engine, which its other games ship", 'blocked': 'one game on that engine here'}),
+     ('k_locks', 'FIFA', '', {'what': "Frostbite's frame regulator at a fixed pointer", 'now': 'build', 'goal': 'engine', 'purpose': 'frame rate',
+      'why': "engine code other Frostbite games ship (the simulation's own rate is already set by name)", 'blocked': 'one Frostbite game here'}),
++    ('k_locks', 'Unreal FixedFrameRate', '7b53433fa04477fc8a540bd80d5ce665', {'what': "Unreal's FixedFrameRate field at a fixed address (DRAGON BALL Sparking! ZERO)", 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
++     'why': "the rewriter's console variables (ue_cvar.py) cover t.MaxFPS; this one field of GEngine the game forces to 30 needs its address"}),
+     ('k_ue', '', 'feae83dc9e9fb34c77d0a62f1fa9ae9f', {'what': "UE3's GMalloc setup skipped, the host allocator in (hle_uemalloc.c)", 'now': 'build', 'goal': 'game', 'purpose': 'address space',
+      'why': "UE3 inlines the allocator's constructor into the GMalloc setup and has its own vtable layout (25 slots, 32-bit sizes), so the Unreal 4/5 discovery does not apply"}),
+     ('k_nier_dr', '', '', {'what': "NieR's frame interval and dynamic-resolution floor at fixed addresses", 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
