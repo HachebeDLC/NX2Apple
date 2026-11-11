@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Go=CC=81mez?=
+ <26456472+HachebeDLC@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 21:35:29 +0100
+Subject: [PATCH] docs_patches: classify the CC2 vsync and k_res rows
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: the patch queue page must classify every build-keyed host row; patch 0071 adds the k_res display-mode table beside the CC2 rows
+Issue: HachebeDLC/NX2Apple#1
+---
+ dm/tools/docs_patches.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/dm/tools/docs_patches.py b/dm/tools/docs_patches.py
+index 99cd9d5..22d1114 100644
+--- a/dm/tools/docs_patches.py
++++ b/dm/tools/docs_patches.py
+@@ -80,6 +80,10 @@ HOST_BINDING = [
+      'why': "the rewriter's console variables (ue_cvar.py) cover t.MaxFPS; this one field of GEngine the game forces to 30 needs its address"}),
+     ('k_locks', 'CC2 frame rate', 'd9c42d45d9850c5804749ed9b44198bf', {'what': "CyberConnect2's frame rate byte and vsync counters at fixed addresses (STORM CONNECTIONS)", 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+      'why': "the engine's own 60 fps mode: SetFrameRate stores 60 / fps and the vsync thread signals the frame event every that many vsyncs; the byte at +0xa02 and the two vsync fields are what the game reads back"}),
++    ('k_locks', 'CC2 vsyncs per frame', 'd9c42d45d9850c5804749ed9b44198bf', {'what': "the three STORM CONNECTIONS rows together", 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
++     'why': "one classification covers the table's three rows (the frame rate byte and the two vsync counters of the display object)"}),
++    ('k_res', '', '', {'what': "the game's display-mode rows rewritten for the profile's display_height (STORM CONNECTIONS)", 'now': 'build', 'goal': 'game', 'purpose': 'resolution',
++     'why': "the game picks its output size from its own mode table; the host rewrites two rows so 900 / 1080 exist"}),
+     ('k_ue', '', 'feae83dc9e9fb34c77d0a62f1fa9ae9f', {'what': "UE3's GMalloc setup skipped, the host allocator in (hle_uemalloc.c)", 'now': 'build', 'goal': 'game', 'purpose': 'address space',
+      'why': "UE3 inlines the allocator's constructor into the GMalloc setup and has its own vtable layout (25 slots, 32-bit sizes), so the Unreal 4/5 discovery does not apply"}),
+     ('k_nier_dr', '', '', {'what': "NieR's frame interval and dynamic-resolution floor at fixed addresses", 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',

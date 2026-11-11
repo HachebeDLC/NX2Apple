@@ -1,0 +1,1464 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Go=CC=81mez?=
+ <26456472+HachebeDLC@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 14:56:06 +0100
+Subject: [PATCH] iOS ports: the fork's six v0.7.2 commits, ported onto the
+ 1.0.2 engine
+
+The port from the old v0.7.2 tree: Storm Connections / Sparking Zero / GL-NVN
+fixes, Hades II 1080p+120, Kingdom Hearts multi-program support, the Vulkan
+memory-leak fix, and the three profile keys (present_hz, display_height,
+screen_percentage) moved to the runtime profile.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: carries the iOS ports the fork hosted on its ios-ports branch (Storm Connections / Sparking Zero bring-up, Hades II 1080p+120, KINGDOM HEARTS multi-program apps, the Vulkan movie-frame memory leak, three launcher settings as runtime-profile keys)
+Issue: HachebeDLC/NX2Apple#1
+---
+ dm/games/0100A00019DE0000/game.tsv |   4 +
+ dm/games/game.py                   |  13 ++-
+ dm/games/settings.tsv              |   3 +
+ dm/gfx/gl/hle_gl.m                 | 121 ++++++++++++++++++++--
+ dm/gfx/nvn/hle_nvn.c               |  40 ++++++-
+ dm/gfx/nvn/nvn_mtl.m               |  45 +++++++-
+ dm/gfx/tools/gl_shaders.py         |  16 ++-
+ dm/gfx/tools/uepak.py              |  73 +++++++++++++
+ dm/gfx/vk/hle_vk.m                 |  75 +++++++++++++-
+ dm/host/crash.c                    |  12 +++
+ dm/host/hle_fpslock.c              |  83 ++++++++++++++-
+ dm/host/hle_fs.c                   |  29 ++++--
+ dm/host/hle_movie.c                |   2 +-
+ dm/host/hle_profile.c              |   4 +
+ dm/host/hle_profile.h              |   2 +
+ dm/host/hle_svc.c                  |   4 +-
+ dm/host/hle_thread.c               |  56 ++++++++++
+ dm/host/main.c                     |   1 +
+ dm/host/probe.c                    | 161 +++++++++++++++++++++++++++++
+ dm/ios/tools/build_ipa.sh          |   2 +
+ dm/tools/nx_extract/Program.cs     |   6 ++
+ scripts/build_ipa_from_nsp.py      |  25 +++--
+ 22 files changed, 734 insertions(+), 43 deletions(-)
+
+diff --git a/dm/games/0100A00019DE0000/game.tsv b/dm/games/0100A00019DE0000/game.tsv
+index b5c1203..a71934e 100644
+--- a/dm/games/0100A00019DE0000/game.tsv
++++ b/dm/games/0100A00019DE0000/game.tsv
+@@ -44,6 +44,10 @@ mem_stack	0x10000000
+ app_pool	0xCD500000
+ mem_used	0x6c00000
+ 
++# ---- Frame rate ----
++# The game steps by real time (Melinoë walks the same distance in a held second at 60 and 120 fps), so it runs above 60 on a 120 Hz screen: 120 is the launcher's default
++present_hz	120
++
+ # ---- Widescreen (host only, NOT enabled for this game) ----
+ # The swapchain size 1280x720 is hardcoded twice in main: a rodata entry at +0x6d337c ({u32 w,
+ # u32 h}, dead data) and two immediate instructions at +0x2a6080 (movz/movk x8) that write it into
+diff --git a/dm/games/game.py b/dm/games/game.py
+index d1af0a1..e4df20b 100644
+--- a/dm/games/game.py
++++ b/dm/games/game.py
+@@ -163,6 +163,14 @@ def header_one(g):
+     if ft not in ('0', '30', '60'): sys.exit(f'{g.id}: fps_target must be 0, 30 or 60: {ft}')
+     fm = g.get('fps_max', '60')   # the highest rate fps_target and the player's Frame rate may take: 120 only for a game checked at that speed (hle_nvn.c fps_high)
+     if fm not in ('60', '120'): sys.exit(f'{g.id}: fps_max must be 60 or 120: {fm}')
++    sp = g.get('screen_percentage', '0')   # Unreal r.ScreenPercentage the host sets over the device profile's (hle_fpslock.c k_cvars; DRAGON BALL Sparking! ZERO): 0 = the game's own, else 25 to 200
++    try: spv = float(sp)
++    except ValueError: spv = -1
++    if not (spv == 0 or 25 <= spv <= 200): sys.exit(f'{g.id}: screen_percentage must be 0 or 25 to 200: {sp}')
++    ph = g.get('present_hz', '60')   # frame-rate limit of a game that steps by real time (Hades II): 60, or 120 on a 120 Hz screen (hle_nvn.c present_cfg; display pacing, DM_PRESENT_LINK=2)
++    if ph not in ('60', '120'): sys.exit(f'{g.id}: present_hz must be 60 or 120: {ph}')
++    dh = g.get('display_height', '0')   # the game's own output size picked from its display mode table (hle_fpslock.c k_res; NARUTO X BORUTO Storm Connections): 0 = the game's own, else 720 / 900 / 1080
++    if dh not in ('0', '720', '900', '1080'): sys.exit(f'{g.id}: display_height must be 0, 720, 900 or 1080: {dh}')
+     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
+     if fh not in ('on', 'off'): sys.exit(f'{g.id}: fps_hold must be on or off: {fh}')
+     utp = g.get('ue_texture_pool', '0')   # Unreal's r.Streaming.PoolSize in MB, raised to this on the Mac (hle_uecvar.c; DM_UE_TEXTURE_POOL overrides, and turns it on for iOS): 0 = the game's own pool
+@@ -257,6 +265,9 @@ def header_one(g):
+          f'#define DM_GAME_PSO_MTL4 {int(p4 == "on")}',
+          f'#define DM_GAME_ENC_THREAD {int(et == "on")}',
+          f'#define DM_GAME_NVN_PREFETCH {int(pf == "on")}',
++         f'#define DM_GAME_SCREEN_PERCENTAGE {q(sp)}',
++         f'#define DM_GAME_DISPLAY_HEIGHT {int(dh)}',
++         f'#define DM_GAME_PRESENT_HZ {int(ph)}',
+          *([f'#define DM_GAME_SHARED_FONT_TTF {int(sf == "ttf")}'] if g.get('shared_font', '') else []),   # without the key the host decides by the SDK version (hle_sdk16.c)
+          f'#define DM_GAME_PAD_LAYOUT {("simple", "full", "touch").index(pl)}',
+          f'#define DM_GAME_OPMODE {int(om == "console")}',
+@@ -300,7 +311,7 @@ if __name__ == '__main__':
+                 ('feedback_snap', 'FEEDBACK_SNAP'), ('tex_flush_upload', 'TEX_FLUSH_UPLOAD'), ('render_cond', 'RENDER_COND'),
+                 ('tex_dirty_upload', 'TEX_DIRTY_UPLOAD'), ('tex_dyn_slots', 'TEX_DYN_SLOTS'), ('gpu_timestamps', 'GPU_TS_SEGMENT'),
+                 ('vconv_range', 'VCONV_RANGE'), ('stdalloc_cap', 'STDALLOC_CAP'), ('tex_bc_cpu', 'TEX_BC_CPU'), ('ue_texture_pool', 'UE_TEXTURE_POOL'),
+-                ('enc_thread', 'ENC_THREAD'), ('draw_barriers', 'DRAW_BARRIERS_GAME'), ('game_args', 'ARGS'), ('game_env', 'ENV')]
++                ('enc_thread', 'ENC_THREAD'), ('draw_barriers', 'DRAW_BARRIERS_GAME'), ('present_hz', 'PRESENT_HZ'), ('display_height', 'DISPLAY_HEIGHT'), ('screen_percentage', 'SCREEN_PERCENTAGE'), ('game_args', 'ARGS'), ('game_env', 'ENV')]
+         def val(macro):   # the header's C spelling → the file's plain spelling
+             v = M.get('DM_GAME_' + macro)
+             if v is None: return None
+diff --git a/dm/games/settings.tsv b/dm/games/settings.tsv
+index 89c69f1..3fc6561 100644
+--- a/dm/games/settings.tsv
++++ b/dm/games/settings.tsv
+@@ -16,6 +16,9 @@
+ #             level=basic  a setting a front end shows first;  needs=<VAR>=<value>  a sub-setting, drawn only while the row that sets <VAR> has that value
+ DM_FPS_TARGET	choice	30=30 fps,60=60 fps,120=120 fps?DM_GAME_FPS_MAX==120&platform:mac	DM_GAME_FPS_TARGET	DM_GAME_FPS_TARGET!=0	Game	Frame rate		level=basic
+ DM_PRESENT_INTERVAL	choice	game=30 fps,display=60 fps	display	DM_GAME_PRESENT_DISPLAY==1&DM_GAME_FPS_TARGET==0	Game	Frame rate		level=basic
++DM_SCREEN_PERCENTAGE	choice	50=960x540,66.66=1280x720 (original),83.33=1600x900,100=1920x1080,133.33=2560x1440	DM_GAME_SCREEN_PERCENTAGE	DM_GAME_SCREEN_PERCENTAGE!=0	Game	Internal resolution	Higher is sharper and uses more GPU time and heat.
++DM_PRESENT_HZ	choice	60=60 fps,120=120 fps (ProMotion)	DM_GAME_PRESENT_HZ	DM_GAME_PRESENT_HZ!=60	Game	Frame-rate limit	120 needs a 120 Hz screen; uses more battery and heat.
++DM_DISPLAY_HEIGHT	choice	720=1280x720,900=1600x900 (original),1080=1920x1080	DM_GAME_DISPLAY_HEIGHT	DM_GAME_DISPLAY_HEIGHT!=0	Game	Resolution	Higher is sharper and uses more GPU time and heat.
+ DM_DYNAMIC_RESOLUTION	toggle	-	0	fixups:DYNAMIC_RESOLUTION	Game	Dynamic resolution	Lets the game lower its resolution under load. Turn off to keep full resolution for the selected console mode.
+ DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		level=basic
+ DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic
+diff --git a/dm/gfx/gl/hle_gl.m b/dm/gfx/gl/hle_gl.m
+index c3db28a..5f90226 100644
+--- a/dm/gfx/gl/hle_gl.m
++++ b/dm/gfx/gl/hle_gl.m
+@@ -311,6 +311,7 @@ static uint32_t name_new(void ***tab, uint32_t *n, uint32_t *cap, size_t sz) {
+ typedef struct { att_t col, depth, stencil; uint64_t gen; } fb_t;
+ NAMES(fb_t, g_fbs, g_nfbs, g_capfbs)
+ static fb_t *fb_of(GLuint n) { return n && n < g_nfbs ? g_fbs[n] : NULL; }
++GL(glIsFramebuffer, uint32_t, GLuint f) { return fb_of(f) != NULL; }
+ 
+ typedef struct { uint8_t on, size, norm, div; GLenum type; GLsizei stride; uint64_t off; GLuint buf; } vattr_t;   // div: glVertexAttribDivisor (0 = per vertex)
+ typedef struct { vattr_t a[16]; GLuint ebo; } vao_t;
+@@ -1219,12 +1220,17 @@ static void cap_set(GLenum cap, int on) {
+     "GL_EXT_texture_compression_s3tc", "GL_EXT_texture_filter_anisotropic", "GL_ARB_vertex_array_object", "GL_ARB_direct_state_access", "GL_ARB_half_float_vertex",
+     "GL_ARB_framebuffer_object", "GL_ARB_texture_float", "GL_EXT_texture_sRGB", "GL_KHR_texture_compression_astc_ldr", "GL_NV_shadow_samplers_cube"};
+ #define NEXTS (int)(sizeof g_exts / sizeof *g_exts)
++static __thread int g_api_es = 1;   // see eglBindAPI: EGL's bound API is per thread (OpenGL ES until the thread binds another)
++// Each context keeps the client API bound when it was made; the version strings answer for the context current on the calling thread (STORM CONNECTIONS makes its first context
++// before eglBindAPI, so OpenGL ES, and its second one after binding desktop OpenGL)
++static int g_ctx_es[16], g_nctx; static __thread int tl_ctx_es = -1;
++static int api_es(void) { return tl_ctx_es >= 0 ? tl_ctx_es : g_api_es; }
+ GL(glGetString, const char *, GLenum n) {
+     switch (n) {
+         case GL_VENDOR: return "NVIDIA Corporation";
+         case GL_RENDERER: return "NVIDIA Tegra X1 (nvgpu)/integrated (Metal)";
+-        case GL_VERSION: return "4.5.0 NVIDIA 349.00";
+-        case GL_SHADING_LANGUAGE_VERSION: return "4.50 NVIDIA";
++        case GL_VERSION: return api_es() ? "OpenGL ES 3.2 NVIDIA 349.00" : "4.5.0 NVIDIA 349.00";
++        case GL_SHADING_LANGUAGE_VERSION: return api_es() ? "OpenGL ES GLSL ES 3.20" : "4.50 NVIDIA";
+         case GL_EXTENSIONS: {   // the compatibility profile's one string
+             static char all[1024]; if (!all[0]) for (int i = 0; i < NEXTS; i++) { strlcat(all, g_exts[i], sizeof all); strlcat(all, " ", sizeof all); }
+             return all;
+@@ -1236,8 +1242,8 @@ static void cap_set(GLenum cap, int on) {
+ GL(glGetIntegerv, void, GLenum p, GLint *v) {
+     switch (p) {
+         case GL_NUM_EXTENSIONS: *v = NEXTS; return;
+-        case GL_MAJOR_VERSION: *v = 4; return;
+-        case GL_MINOR_VERSION: *v = 5; return;
++        case GL_MAJOR_VERSION: *v = api_es() ? 3 : 4; return;
++        case GL_MINOR_VERSION: *v = api_es() ? 2 : 5; return;
+         case GL_CONTEXT_PROFILE_MASK: *v = 1; return;   // CONTEXT_CORE_PROFILE_BIT: what the games asked for (Digimon a 4.5 core context); LÖVE takes its core paths (the file header)
+         case GL_CONTEXT_FLAGS: *v = 0; return;
+         case GL_MAX_TEXTURE_SIZE: case GL_MAX_RENDERBUFFER_SIZE: case GL_MAX_CUBE_MAP_TEXTURE_SIZE: *v = 16384; return;
+@@ -1251,6 +1257,10 @@ static void cap_set(GLenum cap, int on) {
+         case GL_MAX_VARYING_VECTORS: *v = 31; return;
+         case GL_MAX_SAMPLES: *v = 8; return;
+         case GL_SAMPLE_BUFFERS: case GL_SAMPLES: *v = 0; return;   // the window surface is not multisampled
++        case 0xd52: case 0xd53: case 0xd54: case 0xd55: case 0xd57: *v = 8; return;   // RED / GREEN / BLUE / ALPHA / STENCIL_BITS of the framebuffer
++        case 0xd56: *v = 24; return;   // DEPTH_BITS
++        case 0x8a34: *v = 256; return;   // UNIFORM_BUFFER_OFFSET_ALIGNMENT
++        case 0x8dfa: *v = 0; return;   // NUM_SHADER_BINARY_FORMATS
+         case GL_VIEWPORT: memcpy(v, S.vp, sizeof S.vp); return;
+         case GL_SCISSOR_BOX: memcpy(v, S.sc, sizeof S.sc); return;
+         case GL_CULL_FACE_MODE: *v = S.cull_face; return;
+@@ -1346,13 +1356,28 @@ static void cap_set(GLenum cap, int on) {
+ // ---------- Sync objects ----------
+ // A fence is the serial of the command buffer being recorded when it was made, signalled when that command buffer completes (g_ev). LÖVE fences each third of its stream
+ // buffers at the end of a frame and waits for the fence three frames later, before it writes that third again
++// The live syncs, as a set: a handle the layer did not make is not dereferenced or freed. NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS: Scaleform deletes the sync of each of its two
++// frame slots before fencing it again, the first time with a slot it never fenced (a value from its own heap): freeing it aborted in libmalloc
+ typedef struct { uint64_t serial; } sync_t;
+-GL(glFenceSync, void *, GLenum cond, GLbitfield flags) { (void)cond; (void)flags; sync_t *s = zalloc(sizeof *s); s->serial = g_serial; return s; }
+-GL(glDeleteSync, void, void *s) { free(s); }
++static pthread_mutex_t g_sync_mu = PTHREAD_MUTEX_INITIALIZER; static void **g_syncs; static int g_nsync, g_capsync;
++static sync_t *sync_new(uint64_t serial) {
++    sync_t *s = zalloc(sizeof *s); s->serial = serial;
++    pthread_mutex_lock(&g_sync_mu);
++    if (g_nsync == g_capsync) { g_capsync = g_capsync ? g_capsync * 2 : 64; g_syncs = realloc(g_syncs, (size_t)g_capsync * sizeof *g_syncs); }
++    g_syncs[g_nsync++] = s; pthread_mutex_unlock(&g_sync_mu); return s;
++}
++static int sync_live(const void *s, int remove) {
++    int found = 0; pthread_mutex_lock(&g_sync_mu);
++    for (int i = 0; i < g_nsync; i++) if (g_syncs[i] == s) { found = 1; if (remove) g_syncs[i] = g_syncs[--g_nsync]; break; }
++    pthread_mutex_unlock(&g_sync_mu); return found;
++}
++GL(glFenceSync, void *, GLenum cond, GLbitfield flags) { (void)cond; (void)flags; return sync_new(g_serial); }
++GL(glDeleteSync, void, void *s) { if (s && sync_live(s, 1)) free(s); else if (s) RED1("glDeleteSync of a handle glFenceSync did not make (%p): ignored", s); }
+ GL(glWaitSync, void, void *s, GLbitfield flags, uint64_t timeout) { (void)s; (void)flags; (void)timeout; }   // a GPU-side wait: the command buffers run in order
+ GLB(glClientWaitSync, GLenum, void *sy, GLbitfield flags, uint64_t timeout_ns) {
+     sync_t *s = sy;
+     if (!s) return 0x911d;   // WAIT_FAILED
++    if (!sync_live(s, 0)) return GL_ALREADY_SIGNALED;   // not one of this layer's: nothing to wait for
+     if (g_ev.signaledValue >= s->serial) return GL_ALREADY_SIGNALED;
+     if (s->serial >= g_serial) {   // its command buffer is still being recorded: commit it now (as GL_SYNC_FLUSH_COMMANDS_BIT asks; without it the wait could never end)
+         if (!timeout_ns && !(flags & GL_SYNC_FLUSH_COMMANDS_BIT)) return GL_TIMEOUT_EXPIRED;
+@@ -1791,6 +1816,8 @@ static void prog_clear(prog_t *p) {
+ }
+ GL(glDeleteProgram, void, GLuint pr) { prog_t *p = prog_of(pr); if (!p) return; prog_clear(p); free(g_sps[pr]); g_sps[pr] = NULL; if (S.prog == pr) S.prog = 0; }
+ GL(glUseProgram, void, GLuint pr) { S.prog = pr; }
++GL(glIsProgram, uint32_t, GLuint pr) { return prog_of(pr) != NULL; }
++GL(glBindSampler, void, GLuint unit, GLuint smp) { (void)unit; if (smp) RED1("sampler objects (glBindSampler) are not implemented: the texture's own parameters are used"); }
+ GL(glGetAttribLocation, GLint, GLuint pr, const GLchar *name) {
+     prog_t *p = prog_of(pr); if (!p || !p->linked) return -1;
+     for (int i = 0; i < p->si[0]->na; i++) if (!strcmp(p->si[0]->a[i].name, name)) return p->amap[p->si[0]->a[i].slot];
+@@ -1816,6 +1843,9 @@ static void prog_clear(prog_t *p) {
+ GL(glGetUniformLocation, GLint, GLuint pr, const GLchar *name) {
+     prog_t *p = prog_of(pr); if (!p || !p->linked) return -1;
+     char nm[64]; strlcpy(nm, name, sizeof nm); int elem = 0;
++    // an element of a sampler array (gl_shaders.py lists each as its own sampler, "tex[1]"); the array's own name is its element 0
++    for (int i = 0; i < p->nu; i++) if (!strcmp(p->u[i].name, nm)) return i * 4096;
++    if (!strchr(nm, '[')) { char e0[64]; snprintf(e0, sizeof e0, "%s[0]", nm); for (int i = 0; i < p->nu; i++) if (!strcmp(p->u[i].name, e0)) return i * 4096; }
+     char *br = strchr(nm, '[');
+     if (br) { elem = atoi(br + 1); *br = 0; }
+     for (int i = 0; i < p->nu; i++) if (!strcmp(p->u[i].name, nm)) return (elem < 0 || elem >= (p->u[i].count ? p->u[i].count : 1)) ? -1 : i * 4096 + elem;
+@@ -1829,7 +1859,17 @@ static void uni_write(GLint loc, GLsizei count, const void *v, int comps, int is
+     int i = loc / 4096, el = loc % 4096;
+     if (i >= p->nu) return;
+     puni_t *u = &p->u[i];
+-    if (is_samp(u->type)) { if (is_int) u->unit = *(const GLint *)v; return; }
++    if (is_samp(u->type)) {
++        if (!is_int) return;
++        u->unit = *(const GLint *)v;
++        char *br = strrchr(u->name, '['); if (!br || count < 2) return;   // glUniform1iv on a sampler array gl_shaders.py split into elements ("tex[1]"): the next elements
++        int base = atoi(br + 1);
++        for (GLsizei k = 1; k < count; k++) {
++            char e[64]; snprintf(e, sizeof e, "%.*s[%d]", (int)(br - u->name), u->name, base + (int)k);
++            for (int j = 0; j < p->nu; j++) if (!strcmp(p->u[j].name, e)) p->u[j].unit = ((const GLint *)v)[k];
++        }
++        return;
++    }
+     int n = u->count ? u->count : 1, rows = cols ? comps / cols : comps, size = cols ? cols * 16 : 16;
+     if (el + count > n) count = n - el;
+     for (int st = 0; st < 2; st++) {
+@@ -1936,8 +1976,11 @@ static void frame_end(void) {
+ EGL(eglInitialize, EGLBoolean, EGLDisplay d, EGLint *major, EGLint *minor) { (void)d; dev_init(); g_egl.init = 1; if (major) *major = 1; if (minor) *minor = 5; return EGL_TRUE; }
+ EGL(eglTerminate, EGLBoolean, EGLDisplay d) { (void)d; return EGL_TRUE; }
+ EGL(eglReleaseThread, EGLBoolean, void) { return EGL_TRUE; }
+-// SDL binds 0 (its API before it has chosen one) when it makes the window again (Balatro's love.window.setMode): nothing to change
+-EGL(eglBindAPI, EGLBoolean, EGLenum api) { if (api && api != 0x30a2) RED1("eglBindAPI(%#x): only desktop OpenGL (0x30a2) is implemented", api); return EGL_TRUE; }
++// The client API the version strings describe: OpenGL ES unless eglBindAPI chose desktop OpenGL (EGL's default API is OpenGL ES), per thread as EGL keeps it. Digimon Story Cyber Sleuth
++// binds desktop GL; NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS binds it on one thread only, and its Scaleform renderer (another thread, an ES context) parses "OpenGL ES x.y": given the
++// desktop string it found version 0, loaded none of its core GL functions (glGetIntegerv among them), took a maximum texture size of 0, created its glyph cache texture 0x0 and then wrote
++// 1024x1024 into it, wrecking the heap. SDL binds 0 (its API before it has chosen one) when it makes the window again (Balatro's love.window.setMode): nothing to change
++EGL(eglBindAPI, EGLBoolean, EGLenum api) { GLOG("eglBindAPI(%#x)", api); if (!api) return EGL_TRUE; g_api_es = api == 0x30a0; if (api != 0x30a2 && api != 0x30a0) RED1("eglBindAPI(%#x): only OpenGL ES (0x30a0) and desktop OpenGL (0x30a2) are known", api); return EGL_TRUE; }
+ // One configuration: RGBA8, depth 24 (32F here), stencil 8, a window surface, desktop OpenGL; it matches the game's attributes
+ EGL(eglChooseConfig, EGLBoolean, EGLDisplay d, const EGLint *attr, EGLConfig *cfg, EGLint n, EGLint *num) {
+     (void)d; (void)attr;
+@@ -1976,10 +2019,12 @@ static void frame_end(void) {
+ EGL(eglCreatePbufferSurface, EGLSurface, EGLDisplay d, EGLConfig cfg, const EGLint *attr) { (void)d; (void)cfg; (void)attr; RED1("eglCreatePbufferSurface: drawing into it is not implemented"); return (EGLSurface)(uintptr_t)4; }
+ EGL(eglCreateContext, EGLContext, EGLDisplay d, EGLConfig cfg, EGLContext share, const EGLint *attr) {
+     (void)d; (void)cfg;
++    if (getenv("DM_GL_NOCTX")) { GLOG("eglCreateContext refused (DM_GL_NOCTX, diagnostic)"); return NULL; }
+     int major = 0, minor = 0; for (int i = 0; attr && attr[i] != 0x3038 && i < 32; i += 2) { if (attr[i] == 0x3098) major = attr[i + 1]; else if (attr[i] == 0x30fb) minor = attr[i + 1]; }
+     if (share) RED1("shared EGL contexts are not implemented (one context)");
+-    GLOG("EGL context: OpenGL %d.%d", major, minor);
+-    return (EGLContext)(uintptr_t)2;
++    int k = g_nctx < 16 ? g_nctx++ : 15; g_ctx_es[k] = g_api_es;
++    GLOG("EGL context %d: %s %d.%d", k, g_api_es ? "OpenGL ES" : "OpenGL", major, minor);
++    return (EGLContext)(uintptr_t)(2 + 2 * k);   // the first context is 2, as before
+ }
+ EGL(eglCreateWindowSurface, EGLSurface, EGLDisplay d, EGLConfig cfg, void *win, const EGLint *attr) {
+     (void)d; (void)cfg; (void)win; (void)attr; dev_init();
+@@ -1993,6 +2038,7 @@ static void frame_end(void) {
+ EGL(eglDestroySurface, EGLBoolean, EGLDisplay d, EGLSurface s) { (void)d; (void)s; return EGL_TRUE; }
+ EGL(eglMakeCurrent, EGLBoolean, EGLDisplay d, EGLSurface dr, EGLSurface rd, EGLContext c) {
+     (void)d; (void)rd;
++    { uintptr_t h = (uintptr_t)c; tl_ctx_es = h >= 2 && !(h & 1) && (h - 2) / 2 < (uintptr_t)g_nctx ? g_ctx_es[(h - 2) / 2] : -1; }
+     static pthread_t th; static int known, sized;
+     if (c && dr) { pthread_t me = pthread_self(); if (!known || !pthread_equal(th, me)) { th = me; known = 1; OLOG("context current on a new thread"); } }
+     // a context's viewport and scissor box start as its first drawable's size (LÖVE reads them back at start)
+@@ -2059,14 +2105,67 @@ static void note_miss(const char *name) {
+     if (g_nmiss < 512) g_miss_name[g_nmiss++] = name;
+     if (getenv("DM_GL_MISSES")) GLOG("[RED] eglGetProcAddress(%s): not implemented, the game gets a null pointer", name);
+ }
++GL(glIsSync, uint32_t, void *s) { return s && sync_live(s, 0); }
++// Queries the layer has no data for: their outputs are written (zero / empty), so a caller never reads what was in its buffers before (Scaleform enumerates what it asked for)
++GL(glGetActiveAttrib, void, GLuint p, GLuint i, GLsizei n, GLsizei *len, GLint *size, GLenum *type, GLchar *name) { (void)p; (void)i; if (len) *len = 0; if (size) *size = 0; if (type) *type = 0; if (name && n > 0) name[0] = 0; }
++GL(glGetBooleanv, void, GLenum e, uint8_t *v) { (void)e; if (v) memset(v, 0, 4); }
++GL(glGetInteger64v, void, GLenum e, int64_t *v) { GLint i[4] = {0}; h_glGetIntegerv(e, i); if (v) for (int k = 0; k < 4; k++) v[k] = i[k]; }
++GL(glGetIntegeri_v, void, GLenum e, GLuint i, GLint *v) { (void)e; (void)i; if (v) v[0] = 0; }
++GL(glGetUniformBlockIndex, GLuint, GLuint p, const GLchar *n) { (void)p; (void)n; return 0xFFFFFFFFu; }   // GL_INVALID_INDEX
++GL(glGetProgramBinary, void, GLuint p, GLsizei n, GLsizei *len, GLenum *fmt, void *bin) { (void)p; (void)n; (void)bin; if (len) *len = 0; if (fmt) *fmt = 0; }
++GL(glGetFramebufferAttachmentParameteriv, void, GLenum t, GLenum a, GLenum pn, GLint *v) {
++    (void)t; if (!v) return; *v = 0; fb_t *f = fb_of(S.fb);
++    if (!f) {   // the default framebuffer: RGBA8 colour, 24-bit depth, 8-bit stencil
++        if (pn == 0x8CD0) *v = 0x8D41;   // FRAMEBUFFER_DEFAULT (reported as a renderbuffer-like object)
++        else if (pn >= 0x8212 && pn <= 0x8215) *v = (a == 0x1801 || a == 0x1802) ? 0 : 8; else if (pn == 0x8216) *v = 24; else if (pn == 0x8217) *v = 8;
++        return; }
++    att_t *at = a == 0x8D00 ? &f->depth : a == 0x8D20 ? &f->stencil : a == 0x821A ? &f->depth : &f->col;
++    switch (pn) {
++        case 0x8CD0: *v = at->kind == 1 ? 0x1702 : at->kind == 2 ? 0x8D41 : 0; break;   // OBJECT_TYPE: TEXTURE / RENDERBUFFER / NONE
++        case 0x8CD1: *v = (GLint)at->name; break;                                       // OBJECT_NAME
++        case 0x8CD2: *v = at->level; break;                                             // TEXTURE_LEVEL
++        case 0x8CD3: *v = at->face; break;                                              // TEXTURE_CUBE_MAP_FACE
++        case 0x8212: case 0x8213: case 0x8214: case 0x8215: *v = at->kind && at != &f->depth && at != &f->stencil ? 8 : 0; break;
++        case 0x8216: *v = at == &f->depth && at->kind ? 24 : 0; break; case 0x8217: *v = at == &f->stencil && at->kind ? 8 : 0; break;
++    }
++}
++GL(glGetBufferParameteriv, void, GLenum t, GLenum pn, GLint *v) { (void)t; (void)pn; if (v) *v = 0; }
++GL(glGetTexParameteriv, void, GLenum t, GLenum pn, GLint *v) { (void)t; (void)pn; if (v) *v = 0; }
++GL(glGetInternalformativ, void, GLenum t, GLenum f, GLenum pn, GLsizei n, GLint *v) { (void)t; (void)f; (void)pn; if (v && n > 0) memset(v, 0, (size_t)n * sizeof *v); }
++GL(glGetQueryObjectuiv, void, GLuint q, GLenum pn, GLuint *v) { (void)q; (void)pn; if (v) *v = 1; }
++GL(glGetSynciv, void, void *s, GLenum pn, GLsizei n, GLsizei *len, GLint *v) { (void)s; (void)pn; if (len) *len = n > 0; if (v && n > 0) *v = 0x9119; }   // GL_SIGNALED
++static uint64_t gl_noop(void) { return 0; }
++// DM_GL_NOOP=log: each unimplemented name gets its own no-op, which logs its first calls (which ones the game really uses)
++#define NNOOP 256
++static const char *g_noop_name[NNOOP]; static int g_noop_n; static _Atomic int g_noop_calls[NNOOP];
++static void *const g_noop_fn[NNOOP];
++static void noop_note(void *f) { int i = 0; while (i < NNOOP - 1 && g_noop_fn[i] != f) i++; int c = atomic_fetch_add(&g_noop_calls[i], 1); if (c < 3) GLOG("unimplemented %s called (call %d)", g_noop_name[i] ? g_noop_name[i] : "?", c + 1); }
++#define NOOP1(i) static uint64_t noop_##i(void) { noop_note((void *)noop_##i); return 0; }
++#define NOOP8(i) NOOP1(i##0) NOOP1(i##1) NOOP1(i##2) NOOP1(i##3) NOOP1(i##4) NOOP1(i##5) NOOP1(i##6) NOOP1(i##7)
++NOOP8(1) NOOP8(2) NOOP8(3) NOOP8(4) NOOP8(5) NOOP8(6) NOOP8(7) NOOP8(10) NOOP8(11) NOOP8(12) NOOP8(13) NOOP8(14) NOOP8(15) NOOP8(16) NOOP8(17) NOOP8(20) NOOP8(21) NOOP8(22) NOOP8(23) NOOP8(24) NOOP8(25) NOOP8(26) NOOP8(27) NOOP8(30) NOOP8(31) NOOP8(32)
++#define NOOPR8(i) (void *)noop_##i##0, (void *)noop_##i##1, (void *)noop_##i##2, (void *)noop_##i##3, (void *)noop_##i##4, (void *)noop_##i##5, (void *)noop_##i##6, (void *)noop_##i##7,
++static void *const g_noop_fn[NNOOP] = { NOOPR8(1) NOOPR8(2) NOOPR8(3) NOOPR8(4) NOOPR8(5) NOOPR8(6) NOOPR8(7) NOOPR8(10) NOOPR8(11) NOOPR8(12) NOOPR8(13) NOOPR8(14) NOOPR8(15) NOOPR8(16) NOOPR8(17) NOOPR8(20) NOOPR8(21) NOOPR8(22) NOOPR8(23) NOOPR8(24) NOOPR8(25) NOOPR8(26) NOOPR8(27) NOOPR8(30) NOOPR8(31) NOOPR8(32) };
++static void *noop_for(const char *name) {
++    for (int i = 0; i < g_noop_n; i++) if (!strcmp(g_noop_name[i], name)) return g_noop_fn[i];
++    if (g_noop_n >= (int)(sizeof g_noop_fn / sizeof *g_noop_fn)) return (void *)gl_noop;
++    g_noop_name[g_noop_n] = strdup(name); return g_noop_fn[g_noop_n++];
++}
++// NVN-GL interop (hle_nvn.c, nvn_mtl.m): the MTLTexture of a GL texture name (made now if it has its levels), its size, and a wait for the GL work a GLsync fences
++void *dm_gl_tex_mtl(uint32_t name) { tex_t *t = tex_of(name); if (!t) return NULL; if (!t->made) tex_make(t, 1); return (__bridge void *)t->tex; }
++int dm_gl_tex_size(uint32_t name, uint32_t *w, uint32_t *h) { tex_t *t = tex_of(name); if (!t || !t->w) return 0; *w = t->w; *h = t->h; return 1; }
++void dm_gl_sync_wait(uint64_t v) { if (v) h_glClientWaitSync((void *)(uintptr_t)v, GL_SYNC_FLUSH_COMMANDS_BIT, 2000000000ull); }   // v: the GLsync (glFenceSync's sync_t)
++
++uint64_t dm_gl_sync_done(void) { return (uint64_t)(uintptr_t)sync_new(0); }   // a GLsync already signalled (nvnSyncCreateGLSync: the NVN work is waited for first)
+ EGL(eglGetProcAddress, void *, const char *name) {
+     static int asked, found; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+     void *fn = name && !strncmp(name, "gl", 2) ? gl_lookup(name) : NULL;
++    if (!fn && name && !strncmp(name, "gl", 2) && getenv("DM_GL_NOOP")) fn = !strcmp(getenv("DM_GL_NOOP"), "log") ? noop_for(name) : (void *)gl_noop;   // diagnostic: unimplemented GL names do nothing instead of being null
+     pthread_mutex_lock(&mu);
+     asked++; if (fn) found++;
+     if (!fn && name && !strncmp(name, "gl", 2)) note_miss(name);
+     if (asked % 500 == 0 || (fn && g_log)) GLOG("eglGetProcAddress: %d names asked, %d implemented, %d not implemented (last %s)", asked, found, g_nmiss, name);
+     if (!fn && name && !strncmp(name, "gl", 2)) fn = gl_stub(name);
++    if (!fn && g_log) GLOG("eglGetProcAddress: %s not implemented (null)", name ? name : "(null)");
+     pthread_mutex_unlock(&mu);
+     return fn;
+ }
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index 01d95fd..53053ed 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -331,8 +331,36 @@ NVN(nvnSamplerPoolGetSize, int, const NVNsamplerPool *sp) { return ((const dpool
+ 
+ // ---------- Textures ----------
+ #define TB(b) ((tex_builder_t *)(b))
++// NVN-GL interop: a texture builder may name a GL texture (nvnTextureBuilderSetGLTextureName); the texture initialized from it is that GL texture, resolved through the GL
++// layer (nvn_mtl.m mtl_tex_gl, hle_gl.m dm_gl_tex_mtl). The name is kept beside the builder (its layout has no spare field). NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS:
++// Scaleform renders the UI with GLES 3.0 into GL textures that the game's NVN renderer then samples
++__attribute__((weak)) int dm_gl_tex_size(uint32_t name, uint32_t *w, uint32_t *h) { (void)name; (void)w; (void)h; return 0; }
++__attribute__((weak)) void dm_gl_sync_wait(uint64_t serial) { (void)serial; }
++__attribute__((weak)) uint64_t dm_gl_sync_done(void) { return 1; }
++void mtl_tex_gl(uint64_t serial, uint32_t name);
++static struct { const void *b; uint32_t name; } g_bgl[64]; static pthread_mutex_t g_bgl_mu = PTHREAD_MUTEX_INITIALIZER;
++static uint32_t bgl_get(const void *b) { uint32_t n = 0; pthread_mutex_lock(&g_bgl_mu); for (int i = 0; i < 64; i++) if (g_bgl[i].b == b) { n = g_bgl[i].name; break; } pthread_mutex_unlock(&g_bgl_mu); return n; }
++static void bgl_set(const void *b, uint32_t name) {
++    pthread_mutex_lock(&g_bgl_mu); int k = -1;
++    for (int i = 0; i < 64; i++) if (g_bgl[i].b == b) { k = i; break; }
++    if (k < 0 && name) for (int i = 0; i < 64; i++) if (!g_bgl[i].b) { k = i; break; }
++    if (k >= 0) { g_bgl[k].b = name ? b : NULL; g_bgl[k].name = name; } else if (name) LOG("[RED] more than 64 texture builders with a GL texture name at once");
++    pthread_mutex_unlock(&g_bgl_mu);
++}
++NVN_NOPROTO(nvnTextureBuilderSetGLTextureName, void, NVNtextureBuilder *b, uint32_t name) { bgl_set(b, name); }
++NVN_NOPROTO(nvnTextureBuilderGetGLTextureName, uint32_t, const NVNtextureBuilder *b) { return bgl_get(b); }
++// GL → NVN: the GL layer commits its work at glFenceSync and hands out that command buffer's serial as the sync; the NVN sync made from it is signalled once that work completed
++// (waited here on the CPU: the GL layer runs on its own Metal queue). NVN → GL: the GL sync made from an NVN sync is created after the NVN work completed, so GL waits on nothing
++NVN_NOPROTO(nvnSyncInitializeFromFencedGLSync, NVNboolean, NVNsync *s, NVNdevice *d, const void *gl) {
++    (void)d; dm_gl_sync_wait((uint64_t)(uintptr_t)gl); *(sync_t *)s = (sync_t){MAGIC('S', 'Y', 'N', 'C'), 1, 0}; return 1;
++}
++NVN_NOPROTO(nvnSyncCreateGLSync, NVNboolean, const NVNsync *s, uint64_t *gl) {
++    const sync_t *o = (const sync_t *)s; if (o->fenced && o->fence) mtl_wait(o->fence, 2000000000ull);
++    if (gl) *gl = dm_gl_sync_done(); return 1;   // a real GLsync of the GL layer (the game may wait for it and delete it)
++}
+ NVN(nvnTextureBuilderSetDefaults, void, NVNtextureBuilder *b) {
+     NVNdevice *dev = TB(b)->dev; memset(b, 0, sizeof(tex_builder_t)); TB(b)->dev = dev;
++    bgl_set(b, 0);
+     TB(b)->d.target = NVN_TEXTURE_TARGET_2D; TB(b)->d.width = TB(b)->d.height = TB(b)->d.depth = TB(b)->d.levels = 1;
+ }
+ NVN(nvnTextureBuilderSetDevice, void, NVNtextureBuilder *b, NVNdevice *d) { TB(b)->dev = d; }
+@@ -585,7 +613,11 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
+     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8); o->set_swz = s->set_swz; o->stencil = s->stencil; o->swz = s->swz;
+     nvn_tex_layout(&o->d, &o->L);
+     o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
+-    o->serial = nvn_new_serial(); mtl_tex_init(o);
++    o->serial = nvn_new_serial();
++    {   uint32_t gn = bgl_get(b);   // over a GL texture: its size, and a format so the description is valid (the MTLTexture is the GL layer's)
++        if (gn) { uint32_t w, h; if (dm_gl_tex_size(gn, &w, &h)) { o->d.width = w; o->d.height = h; } if (!o->d.format) o->d.format = NVN_FORMAT_RGBA8; mtl_tex_gl(o->serial, gn);
++                  static int n; if (n++ < 4) LOG("[nvn] texture ser=%llu over GL texture %u (%ux%u)", (unsigned long long)o->serial, gn, o->d.width, o->d.height); } }
++    mtl_tex_init(o);
+     {   // DM_NVN_TEXINFO=WxH also logs every texture of that size as it is initialized (render targets included): which ones share storage, and how their descriptions differ
+         static int ti = -1; static uint32_t tw, th;
+         if (ti < 0) { const char *e = getenv("DM_NVN_TEXINFO"); ti = e && sscanf(e, "%ux%u", &tw, &th) == 2; }
+@@ -603,7 +635,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
+     ft_add(o);
+     return 1;
+ }
+-NVN(nvnTextureFinalize, void, NVNtexture *t) { ft_del(TX(t)->serial); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
++NVN(nvnTextureFinalize, void, NVNtexture *t) { ft_del(TX(t)->serial); mtl_tex_gl(TX(t)->serial, 0); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
+ NVN(nvnTextureGetFlags, NVNtextureFlags, const NVNtexture *t) { return (NVNtextureFlags)CTX(t)->d.flags; }
+ NVN(nvnTextureGetWidth, int, const NVNtexture *t) { return (int)CTX(t)->d.width; }
+ NVN(nvnTextureGetHeight, int, const NVNtexture *t) { return (int)CTX(t)->d.height; }
+@@ -2240,13 +2272,13 @@ static void present_cfg(const win_t *o) {
+     if (g_hz >= 0) return;
+     // The interval mode comes from the game profile (present_interval, default game): whether frames follow the present interval the game sets depends on whether the game's logic counts frames, which differs per game. Environment variables override it, and can override the fixed 60 Hz.
+     int scr = mtl_display_hz();
+-    const char *e = getenv("DM_PRESENT_HZ"); g_hz = e ? atoi(e) : fstep_hz();
++    const char *e = getenv("DM_PRESENT_HZ"); g_hz = e ? atoi(e) : dm_prof()->present_hz > 60 ? dm_prof()->present_hz : fstep_hz();   // the profile's present_hz: 120 for a game that steps by real time (Hades II)
+     if (!g_hz) LOG("[nvn] [WARNING] DM_PRESENT_HZ=0: frame rate uncapped, frame pacing unlike the device, UI logic may drift (for profiling only, not for verdicts / cross-checks)");
+     // Cut (intentional deviation from the original game's behavior): with DM_PRESENT_INTERVAL=display the present interval set by the game is not followed and one frame is presented per display-link tick,
+     // with a fixed hard floor of 60 fps; the logic stays at 25 ticks, and the client's frame-counted UI logic is unaffected -
+     // with the same save and the same input, the UI message streams of the two modes match message by message. Proof (before character select): r9 game / display 60 ×3 / display 120 ×2, 6 groups in total, uicmp consistent
+     // (the save indicator is exempted as a timing race), and the timing differences of key messages are within game mode's own noise band; proof after entering a run is still missing, pending action script coverage
+-    const char *m = getenv("DM_PRESENT_INTERVAL"); g_display_mode = m ? !strcmp(m, "display") : dm_prof()->present_display;
++    const char *m = getenv("DM_PRESENT_INTERVAL"); g_display_mode = m ? !strcmp(m, "display") : dm_prof()->present_display || g_hz > 60;   // above 60 Hz one frame per tick: the game interval's vsyncs are 60 Hz units
+     LOG("[nvn] present tick %d Hz, interval mode %s (%s; present interval set by the game %d; %s)", g_hz, g_display_mode ? "display (one frame per tick, a cut)" : "game (original semantics)",
+         m ? "DM_PRESENT_INTERVAL" : "game profile present_interval", o->interval, scr > 0 ? "window" : "no window");
+ }
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 167c0ce..45b450b 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -654,6 +654,7 @@ void mtl_init(void) {
+     if (g_dev) return;
+     const char *vbc = getenv("DM_NVN_VBUF_CACHE"); g_vbuf_cache = !(vbc && !strcmp(vbc, "0"));
+     const char *link = getenv("DM_PRESENT_LINK");
++    { const char *hz = getenv("DM_PRESENT_HZ"); if (!link && (hz ? atoi(hz) : dm_prof()->present_hz) > 60) link = "2"; }   // a present rate above 60 Hz needs the 120 Hz display link
+     g_dm_present_link = link ? atoi(link) : 1; if (g_dm_present_link < 0 || g_dm_present_link > 2) g_dm_present_link = 1; g_present_link_env = link != NULL;   // Default 1 (real-device same-process alternation: when load exceeds one display-link period, long frames 15% → 0 and frame intervals even out; no difference from 0 at a steady 60); DM_PRESENT_LINK=0 turns it off   // 1 = present on every tick of a 60 Hz display link; 2 = 120 Hz display link, the game presents a frame every other display-link tick (when behind, it can present on the next 8.33 ms display-link tick)
+     const char *latency = getenv("DM_PRESENT_LATENCY");
+     if (latency && atoi(latency) > 0) g_present_latency = atoi(latency);
+@@ -2615,6 +2616,16 @@ void mtl_alias_drop_pool(const void *pool) {
+ // every texture ID down the slow path and made the next walk build the 33,025-entry table whole. Caller holds g_smu
+ enum { ALIAS_IDLE = 16 };
+ static uint64_t g_alias_taken;   // shared textures evicted when another texture took over their storage (for the memory report)
++// Whether another shared entry is a level view of this texture (alias_level_view): the view holds no residency of its own (it is no allocation), so the texture stays shared and
++// resident while a view of it is. Evicting it removed it from the residency set while a later serial still sampled it through the view: a GPU address fault on an iPhone
++// (Storm Connections' character select, which keeps rebuilding textures over the same storage). Caller holds g_smu
++static int alias_has_view_of(id o) {
++    for (uint32_t i = 0; i < g_alias.cap; i++) {
++        id v = (__bridge id)g_alias.vals[i];
++        if (v && v != o && [v conformsToProtocol:@protocol(MTLTexture)] && ((id<MTLTexture>)v).parentTexture == o) return 1;
++    }
++    return 0;
++}
+ static void alias_take_over(const alias_key *nk) {
+     nvn_texlayout L; nvn_tex_layout(&nk->d, &L);
+     if (!L.size) return;
+@@ -2626,7 +2637,7 @@ static void alias_take_over(const alias_key *nk) {
+         if (k.pool != nk->pool || !memcmp(&k, nk, sizeof k) || k.off >= hi) continue;
+         nvn_texlayout kl; nvn_tex_layout(&k.d, &kl);
+         uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, &k);
+-        if (k.off + (int64_t)kl.size <= lo || (seen && g_fence + 1 - seen < ALIAS_IDLE) || serial_table_holds(g_alias.vals[i])) continue;
++        if (k.off + (int64_t)kl.size <= lo || (seen && g_fence + 1 - seen < ALIAS_IDLE) || serial_table_holds(g_alias.vals[i]) || alias_has_view_of((__bridge id)g_alias.vals[i])) continue;
+         ks[n++] = k;
+     }
+     for (uint32_t j = 0; j < n; j++) {
+@@ -2640,6 +2651,23 @@ static void alias_take_over(const alias_key *nk) {
+     if (n) { ser_note(0); g_alias_taken += n; }
+ }
+ static __unsafe_unretained id serial_get(uint64_t k) { pthread_mutex_lock(&g_smu); __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); pthread_mutex_unlock(&g_smu); return o; }
++// A texture over the storage of a shared one with the same description but fewer mip levels is a view of its first levels: Storm Connections builds its title backdrop textures
++// (BC1 2048x1024) with 6 levels, fills them by GPU copy, then builds a 5-level object over the same storage and samples that one (a separate Metal texture stayed empty: a black sky).
++// Caller holds g_smu
++static id<MTLTexture> alias_level_view(const alias_key *nk) {
++    for (uint32_t i = 0; i < g_alias.cap; i++) {
++        if (!g_alias.vals[i]) continue;
++        alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
++        if (k.pool != nk->pool || k.off != nk->off || k.d.levels <= nk->d.levels || !nk->d.levels) continue;
++        nvn_texdesc a = k.d; a.levels = nk->d.levels;
++        if (memcmp(&a, &nk->d, sizeof a)) continue;
++        id<MTLTexture> base = (__bridge id<MTLTexture>)g_alias.vals[i];
++        NSUInteger sl = base.textureType == MTLTextureTypeCube ? 6 : base.textureType == MTLTextureTypeCubeArray ? base.arrayLength * 6 : base.textureType == MTLTextureType3D ? 1 : base.arrayLength;
++        if (nk->d.levels > base.mipmapLevelCount) return nil;
++        return [base newTextureViewWithPixelFormat:base.pixelFormat textureType:base.textureType levels:NSMakeRange(0, nk->d.levels) slices:NSMakeRange(0, sl)];
++    }
++    return nil;
++}
+ static void serial_put(uint64_t k, id o) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { held_add((__bridge void *)old, -1); if (alias_has(old)) defer_obj_unref(old); else defer_obj_release(old); } hm_put_id(&g_by_serial, &k, o); held_add((__bridge void *)o, 1); ser_note(k); pthread_mutex_unlock(&g_smu); }
+ static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { held_add((__bridge void *)old, -1); if (alias_has(old)) defer_obj_unref(old); else defer_obj_release(old); hm_del_id(&g_by_serial, &k); ser_note(k); } pthread_mutex_unlock(&g_smu); }   // nothing to drop: the texture ID caches stay valid
+ // Texture serials owned by a live NVN texture object (TextureInitialize until Finalize or re-initialization, hle_nvn.c). Command records and texture pool registrations snapshot the
+@@ -4341,10 +4369,20 @@ static void sparse_view(NvPkg *pk, const tex_t *t) {
+     });
+     return f < 256 ? tw[f] : tw[0];
+ }
++// NVN textures built over a GL texture name (nvnTextureBuilderSetGLTextureName, NVN-GL interop): serial → GL name. They resolve to the GL layer's own MTLTexture
++// (hle_gl.m dm_gl_tex_mtl), made on demand and remade when the game redefines it. NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS: Scaleform draws the UI with GLES 3.0
++// into GL textures that the game's NVN renderer samples
++static nvn_hmap g_gltex = {.klen = sizeof(uint64_t)};
++__attribute__((weak)) void *dm_gl_tex_mtl(uint32_t name) { (void)name; return NULL; }
++void mtl_tex_gl(uint64_t serial, uint32_t name) { pthread_mutex_lock(&g_smu); if (name) nvn_hm_put(&g_gltex, &serial, (void *)(uintptr_t)name); else nvn_hm_del(&g_gltex, &serial); pthread_mutex_unlock(&g_smu); }
+ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
+     tex_t *t = (tex_t *)ct;
+     if (!t || !t->serial) return nil;
+     if (on_sub_thread()) cpu_unc_drop();
++    if (g_gltex.n) {
++        pthread_mutex_lock(&g_smu); uint32_t gn = (uint32_t)(uintptr_t)nvn_hm_get(&g_gltex, &t->serial); pthread_mutex_unlock(&g_smu);
++        if (gn) { id<MTLTexture> m = (__bridge id<MTLTexture>)dm_gl_tex_mtl(gn); res_add(m); return m; }
++    }
+     if (t->magic != MAGIC('T', 'E', 'X', 0)) { RED_ONCE(70, "texture object no longer valid (magic %#x, first case ser=%llu): no MTLTexture created", t->magic, (unsigned long long)t->serial); return nil; }
+     // t->pool is the game's object, named by a copy of the texture that an ID or a record keeps past its life: nvnMemoryPoolFinalize clears the magic, and the game then frees the memory, which
+     // then reads as anything. Everything below reads it: garbage in its vp sent an upload through a page table that was never there (nvn_sparse_protect, FINAL FANTASY RESONANCE, GitHub issue #934)
+@@ -4485,6 +4523,11 @@ static void sparse_view(NvPkg *pk, const tex_t *t) {
+         }
+         if (v) { tex_put(t->serial, v); return v; }
+     }
++    pthread_mutex_lock(&g_smu);
++    id<MTLTexture> lv = g_alias_set ? alias_level_view(&ak) : nil;
++    if (lv) { hm_put_id(&g_alias, &ak, lv); CFSetAddValue(g_alias_set, (__bridge const void *)lv); nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1)); }
++    pthread_mutex_unlock(&g_smu);
++    if (lv) { static int n; if (n++ < 5) MLOG("texture ser=%llu %ux%u format %#x: a view of the first %u levels of the texture already on its storage", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels); tex_put(t->serial, lv); return lv; }
+     id<MTLTexture> mt = tex_linear(t);
+     if (!mt && t->pool && nvn_sparse_pool(t->pool)) mt = sparse_gpu_make(t);   // a large one in a sparse pool: only the tiles the game maps take memory
+     if (!mt) {
+diff --git a/dm/gfx/tools/gl_shaders.py b/dm/gfx/tools/gl_shaders.py
+index ee29a1e..55dd3d6 100644
+--- a/dm/gfx/tools/gl_shaders.py
++++ b/dm/gfx/tools/gl_shaders.py
+@@ -70,7 +70,9 @@ def sources(roots):
+ # NVIDIA's GLSL compiler accepts more than the GLSL ES 3.20 specification, and glslang does not; these fix-ups run on the preprocessed text (glslang -E, so macros are expanded):
+ #   · the GLSL ES 1.0 texture functions (89 of Digimon's fragment shaders call textureCube; with -V glslang reads textureCube as Vulkan's texture type, so a macro cannot rename it);
+ #   · a redeclaration of gl_Position as a plain output (the built-in sprite shader of main declares `out float4 vPosition;` with vPosition defined as gl_Position);
+-#   · textureOffset with an offset that is not a constant (the built-in FXAA shader): Metal's sample offsets are constants too, so it becomes texture at P + offset / level 0 size
++#   · textureOffset with an offset that is not a constant (the built-in FXAA shader): Metal's sample offsets are constants too, so it becomes texture at P + offset / level 0 size;
++#   · an array of samplers indexed by constants (Storm Connections' Scaleform: `uniform sampler2D tex[2];` read as tex[int(1.0)]) becomes one sampler per element, <name>_SA<k>,
++#     listed in the table as <name>[<k>] (the host's GL layer gives each element its own location, as GL does)
+ OLD_TEX = [(r'\btexture2DLod\s*\(', 'textureLod('), (r'\btextureCubeLod\s*\(', 'textureLod('), (r'\btexture2DProj\s*\(', 'textureProj('),
+            (r'\btexture2D\s*\(', 'texture('), (r'\btextureCube\s*\(', 'texture(')]
+ 
+@@ -86,8 +88,16 @@ def call_args(t, i):
+         elif c == ',' and depth == 1: args.append(t[start:k]); start = k + 1
+     raise ValueError('unbalanced parentheses')
+ 
++def sampler_arrays(t):
++    for m in list(re.finditer(r'^([ \t]*uniform\s+(?:(?:highp|mediump|lowp)\s+)?sampler\w+\s+)(\w+)\s*\[\s*(\d+)\s*\]\s*;', t, flags=re.M)):
++        pre, nm, n = m.group(1), m.group(2), int(m.group(3))
++        t = t.replace(m.group(0), '\n'.join(f'{pre}{nm}_SA{k};' for k in range(n)))
++        t = re.sub(rf'\b{nm}\s*\[\s*(?:int\s*\(\s*)?(\d+)(?:\.0*)?\s*\)?\s*\]', lambda x: f'{nm}_SA{x.group(1)}', t)
++    return t
++
+ def fixups(t):
+     for a, b in OLD_TEX: t = re.sub(a, b, t)
++    t = sampler_arrays(t)
+     t = re.sub(r'^[ \t]*out\s+(?:highp\s+|mediump\s+|lowp\s+)?vec4\s+gl_Position\s*;', '', t, flags=re.M)
+     out, i = [], 0
+     for m in re.finditer(r'\btextureOffset\s*\(', t):
+@@ -141,6 +151,8 @@ def translate(src, stage, key, tmp):
+     r = subprocess.run(['glslangValidator', '-E', '-S', stage, g + '.in'], capture_output=True, text=True)
+     if r.returncode: return 'glslang -E: ' + ' | '.join(l for l in (r.stdout + r.stderr).splitlines() if 'ERROR' in l and 'compilation' not in l)[:400]
+     pre = r.stdout[r.stdout.find('#version'):]   # warnings come first
++    # SPIR-V needs GLSL ES 3.10 or later; 3.00 ES source compiles unchanged as 3.10 (NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS: Scaleform's shaders are #version 300 es)
++    pre = re.sub(r'^#version\s+300\s+es\b', '#version 310 es', pre)
+     open(g, 'w').write(fixups(pre))
+     r = subprocess.run(['glslangValidator', '-V', '-R', '--aml', '--amb', '-S', stage, g, '-o', spv], capture_output=True, text=True)
+     if r.returncode: return 'glslang: ' + ' | '.join(l for l in (r.stdout + r.stderr).splitlines() if 'ERROR' in l and 'compilation' not in l)[:400]
+@@ -169,7 +181,7 @@ def translate(src, stage, key, tmp):
+         if e: return e
+     for t in refl.get('textures', []):
+         if t.get('array'): return f'sampler array {t["name"]}'
+-        f.append(f't:{t["name"]}={t["binding"]}:{t["type"]}')
++        f.append(f't:{re.sub(r"_SA(\d+)$", r"[\1]", t["name"])}={t["binding"]}:{t["type"]}')
+     for k in ('separate_images', 'separate_samplers', 'images', 'ssbos', 'push_constants'):
+         if refl.get(k): return f'{k} are not implemented'
+     if any(int(x) > 15 for x in re.findall(r'\[\[(?:sampler|buffer)\((\d+)\)\]\]', m)): return 'a buffer or sampler slot above 15'
+diff --git a/dm/gfx/tools/uepak.py b/dm/gfx/tools/uepak.py
+index 8af600d..370fd81 100644
+--- a/dm/gfx/tools/uepak.py
++++ b/dm/gfx/tools/uepak.py
+@@ -493,6 +493,78 @@ def io_archive(toc, i, decode, chunk=None):
+     out += struct.pack('<I', 0) + struct.pack(f'<I{len(idx)}I', len(idx), *idx)
+     return bytes(out) + b''.join(code)
+ 
++def plain_archive(shaders):
++    """A version 2 shader code archive of decoded shaders [(code, frequency)], one shader map holding them all and zero hashes (shader_split.py reads only the entries and the code)"""
++    n = len(shaders); out = bytearray(struct.pack('<II', ARCHIVE_VERSION, 1) + bytes(20) + struct.pack('<I', n) + bytes(20 * n) + struct.pack('<IIIII', 1, 0, n, 0, 0) + struct.pack('<I', n)); off = 0
++    for c, fr in shaders: out += struct.pack('<QIIB', off, len(c), len(c), fr); off += len(c)
++    out += struct.pack('<I', 0) + struct.pack(f'<I{n}I', n, *range(n))
++    return bytes(out) + b''.join(c for c, _ in shaders)
++
++def inline_shader_maps(d, decode, seen):
++    """Shaders kept inline in cooked Unreal 4.27 packages (DRAGON BALL Sparking! ZERO: the material shader maps in its IoStore export bundles, the global ones in
++    Engine/GlobalShaderCache-SP_GLSL_SWITCH.bin; it has no shader code archive): FShaderMapResourceCode's entries are {i32 code length, the code, i32 raw size, u8 frequency}, the code an
++    Oodle stream (Mermaid, 8C 0A) when shorter than its raw size, else the LSLG record itself. Found by that frame around an Oodle header or an LSLG magic; kept when it decodes to an LSLG record
++    (lslg) whose stage matches the frequency. seen = the shader hashes taken so far (one copy of each). → [(record, frequency)]"""
++    import hashlib, re
++    out = []
++    for m in re.finditer(rb'\x8c[\x00-\x0f]|LSLG', d):
++        p = m.start()
++        if p < 4: continue
++        n = struct.unpack_from('<I', d, p - 4)[0]
++        if not 64 <= n <= len(d) - p - 5: continue
++        raw, fr = struct.unpack_from('<IB', d, p + n)
++        if fr not in FREQ or not n <= raw < 1 << 22 or (raw == n) != (d[p] == 0x4c): continue
++        c = d[p:p + n]
++        if raw != n:
++            if b'LSLG' not in c[:64]: continue   # Mermaid keeps the record's first bytes as literals
++            try: c = decode(c, raw)
++            except ValueError: continue
++        rec = lslg(c)
++        if not rec or FREQ[fr] != {'SV': 'vs', 'SH': 'hs', 'SD': 'ds', 'SG': 'gs', 'SP': 'ps', 'SC': 'cs'}.get(rec[0]): continue
++        h = hashlib.sha1(c).digest()
++        if h not in seen: seen.add(h); out.append((c, fr))
++    return out
++
++def toc_chunks(toc, idxs, decode):
++    """The chunks idxs of an IoStore container, each block decoded once (chunks in stream order share blocks): yields (index, bytes)"""
++    cache = {}
++    for i in sorted(idxs, key=lambda i: toc.ranges[i][0]):
++        off, ln = toc.ranges[i]
++        if not ln: continue
++        first, last = off // toc.block_size, (off + ln - 1) // toc.block_size; parts = []
++        for k in range(first, last + 1):
++            if k not in cache:
++                at, size, raw, m = toc.blocks[k]; f = toc.ucas(at // toc.part_size); f.seek(at % toc.part_size)
++                b = f.read((size + 15) & ~15 if toc.encrypted else size)
++                if toc.encrypted: b = aes_decrypt(toc.key, b)[:size]
++                meth = toc.methods[m - 1] if m else ''
++                cache[k] = b[:raw] if not meth else decode(b, raw) if meth == 'Oodle' else None
++                if cache[k] is None: raise ValueError(f'{toc.path}: compression method {meth} is not read')
++            parts.append(cache[k])
++        for k in [k for k in cache if k < first]: del cache[k]
++        s = off - first * toc.block_size
++        yield i, b''.join(parts)[s:s + ln]
++
++def inline_job(romfs, key, decode, work, listing):
++    """The inline shaders (inline_shaders) of every pak file and every IoStore export bundle, one decoded archive per container (ShaderArchive-Inline-<container>), for a game without shader
++    code archives (DRAGON BALL Sparking! ZERO). Writes them into <work>/archives and adds them to listing"""
++    seen = set()
++    def put(name, src, path, shaders):
++        if not shaders: return
++        name = f'ShaderArchive-Inline-{name}.ushaderbytecode'
++        open(os.path.join(work, 'archives', name), 'wb').write(plain_archive(shaders))
++        listing.append(dict(name=name, pak=os.path.relpath(src, romfs), path=path, shaders=len(shaders), compressed=0, compression='inline, decoded'))
++    for pak in unreal_paks(romfs):
++        p = Pak(pak, key); found = []
++        for path in sorted(p.files): found += inline_shader_maps(p.read(path, decode=decode), decode, seen)
++        put(os.path.splitext(os.path.basename(pak))[0] + '-pak', pak, 'pak files', found)
++    for dp, _, fs in os.walk(romfs):
++        for f in sorted(fs):
++            if not f.endswith('.utoc'): continue
++            t = Toc(os.path.join(dp, f), key); found = []
++            for _, b in toc_chunks(t, t.of_type(IO_EXPORT_BUNDLE), decode): found += inline_shader_maps(b, decode, seen)
++            put(os.path.splitext(f)[0], os.path.join(dp, f), 'export bundles', found)
++
+ def mount_order(path):
+     """A container's place in the mount stack: the game's container first, then the numbered patch chunks in order. A chunk ID that two containers both have resolves to the later container, as in
+     the engine: the update's Glow-Switch_0_P.utoc (LEGO Horizon Adventures) carries the shader libraries' full tables with the base container's Glow-Switch.utoc, and lists the groups it did not
+@@ -603,6 +675,7 @@ def job(romfs, main_nso, work, decode=None):
+             for i in comp:
+                 off, size, raw, _ = a['shaders'][i]; recs.append((name, i, b[a['code'] + off:a['code'] + off + size], raw))
+             listing.append(dict(name=name, pak=os.path.relpath(pak, romfs), path=path, shaders=len(a['shaders']), compressed=len(comp), compression=how))
++    if not listing and decode and unreal_paks(romfs): inline_job(romfs, key, decode, work, listing)   # no shader code archive: the shader maps inline in the packages
+     with open(os.path.join(work, 'oodle.job'), 'wb') as f:
+         f.write(struct.pack('<II', JOB_MAGIC, len(recs)))
+         for _, _, c, raw in recs: f.write(struct.pack('<II', len(c), raw)); f.write(c)
+diff --git a/dm/gfx/vk/hle_vk.m b/dm/gfx/vk/hle_vk.m
+index bdf70f5..e5404b8 100644
+--- a/dm/gfx/vk/hle_vk.m
++++ b/dm/gfx/vk/hle_vk.m
+@@ -232,6 +232,7 @@ static void dev_init_once(void) {
+     // pipeline keeps its depth-stencil description and builds the state for the masks set (one cached)
+     VkLogicOp logic;   // not implemented (0 = none: VK_LOGIC_OP_CLEAR is not met)
+     int dyn_sref, dyn_smask, stencil; VkStencilOpState sf, sb; MTLCompareFunction dcmp; int dwrite; uint64_t dss_key; __strong id<MTLDepthStencilState> dss_dyn;
++    int dyn_blend;   // vkCmdSetBlendConstants
+ };
+ struct VkCommandPool_T { struct VkCommandBuffer_T *cbs; };
+ struct VkCommandBuffer_T { void *loader; VkCommandPool pool; struct VkCommandBuffer_T *prev, *next; uint8_t *buf; size_t n, cap; };
+@@ -476,8 +477,8 @@ static void dedicated_req(void *pn) {
+ VKB(vkMapMemory, VkResult, VkDevice d, VkDeviceMemory m, VkDeviceSize off, VkDeviceSize size, VkMemoryMapFlags fl, void **pp) {
+     (void)d; (void)size; (void)fl;
+     if (m->type == 0) RED1("mapped invisible memory (type 0)");
+-    id<MTLBuffer> b = mem_buf(m); if (!b) return VK_ERROR_MEMORY_MAP_FAILED;
+-    *pp = (uint8_t *)b.contents + off; return VK_SUCCESS;
++    @autoreleasepool { id<MTLBuffer> b = mem_buf(m); if (!b) return VK_ERROR_MEMORY_MAP_FAILED; *pp = (uint8_t *)b.contents + off; }
++    return VK_SUCCESS;
+ }
+ VK(vkUnmapMemory, void, VkDevice d, VkDeviceMemory m) { (void)d; (void)m; }
+ VK(vkFlushMappedMemoryRanges, VkResult, VkDevice d, uint32_t n, const VkMappedMemoryRange *r) { (void)d; (void)n; (void)r; return VK_SUCCESS; }   // shared storage is coherent
+@@ -494,7 +495,7 @@ static void dedicated_req(void *pn) {
+     h_vkGetBufferMemoryRequirements(d, i->buffer, &r->memoryRequirements); dedicated_req(r->pNext);
+ }
+ VKB(vkBindBufferMemory, VkResult, VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize off) {
+-    (void)d; b->mem = m; b->off = off; return mem_buf(m) ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
++    (void)d; b->mem = m; b->off = off; @autoreleasepool { return mem_buf(m) ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY; }
+ }
+ VKB(vkBindBufferMemory2, VkResult, VkDevice d, uint32_t n, const VkBindBufferMemoryInfo *bi) {
+     for (uint32_t i = 0; i < n; i++) { VkResult r = h_vkBindBufferMemory(d, bi[i].buffer, bi[i].memory, bi[i].memoryOffset); if (r) return r; }
+@@ -1082,6 +1083,7 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
+             else if (s == VK_DYNAMIC_STATE_STENCIL_REFERENCE) p->dyn_sref = 1;
+             else if (s == VK_DYNAMIC_STATE_LINE_WIDTH) continue;   // Metal draws lines one pixel wide whatever the width (Super Mario 64 sets 1)
+             else if (s == VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK || s == VK_DYNAMIC_STATE_STENCIL_WRITE_MASK) p->dyn_smask |= s == VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK ? 1 : 2;
++            else if (s == VK_DYNAMIC_STATE_BLEND_CONSTANTS) p->dyn_blend = 1;
+             else RED1("dynamic state %d not implemented (the imports have no matching set function)", s);
+         }
+         const VkPipelineViewportStateCreateInfo *vs = ci->pViewportState;
+@@ -1102,7 +1104,7 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
+ VKB(vkDestroyPipeline, void, VkDevice d, VkPipeline p, const VkAllocationCallbacks *a) { (void)d; (void)a; if (p && vk_live_del(p)) dtor_pipe(p); }
+ 
+ // ---------- Command buffers: recording ----------
+-enum { C_BRP = 1, C_ERP, C_PIPE, C_SETS, C_VB, C_IB, C_VP, C_SC, C_DRAWI, C_COPYB, C_COPYB2I, C_DRAW, C_PUSH, C_COPYI, C_COPYI2B, C_QRESET, C_QTS, C_QBEGIN, C_QEND, C_CLEARI, C_STENCIL };
++enum { C_BRP = 1, C_ERP, C_PIPE, C_SETS, C_VB, C_IB, C_VP, C_SC, C_DRAWI, C_COPYB, C_COPYB2I, C_DRAW, C_PUSH, C_COPYI, C_COPYI2B, C_QRESET, C_QTS, C_QBEGIN, C_QEND, C_CLEARI, C_STENCIL, C_BLEND, C_CLRATT, C_RESOLVE };
+ typedef struct { uint32_t op, size; } chdr;
+ typedef struct { VkRenderPass rp; VkFramebuffer fb; VkRect2D area; uint32_t nclear; VkClearValue clear[]; } c_brp;
+ typedef struct { VkPipeline p; } c_pipe;
+@@ -1121,6 +1123,9 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
+ typedef struct { VkQueryPool q; uint32_t first, n; } c_query;
+ typedef struct { int what; VkStencilFaceFlags faces; uint32_t v; } c_stencil;   // what: 0 compare mask, 1 write mask, 2 reference
+ typedef struct { VkImage im; int ds; VkClearValue v; uint32_t n; VkImageSubresourceRange r[]; } c_cleari;   // vkCmdClearColorImage / vkCmdClearDepthStencilImage
++typedef struct { float c[4]; } c_blend;
++typedef struct { uint32_t na, nr; VkClearAttachment a[9]; VkClearRect r[]; } c_clratt;
++typedef struct { VkImage src, dst; uint32_t n; VkImageResolve r[]; } c_resolve;
+ static void *rec(VkCommandBuffer cb, uint32_t op, size_t sz) {
+     size_t need = (sizeof(chdr) + sz + 7) & ~(size_t)7;
+     if (cb->n + need > cb->cap) {
+@@ -1217,6 +1222,14 @@ static void rec_clear(VkCommandBuffer cb, VkImage im, int ds, const VkClearValue
+ VK(vkCmdResetQueryPool, void, VkCommandBuffer cb, VkQueryPool q, uint32_t first, uint32_t n) { *(c_query *)rec(cb, C_QRESET, sizeof(c_query)) = (c_query){q, first, n}; }
+ VK(vkCmdWriteTimestamp, void, VkCommandBuffer cb, VkPipelineStageFlagBits st, VkQueryPool q, uint32_t i) { (void)st; *(c_query *)rec(cb, C_QTS, sizeof(c_query)) = (c_query){q, i, 1}; }
+ VK(vkCmdBeginQuery, void, VkCommandBuffer cb, VkQueryPool q, uint32_t i, VkQueryControlFlags f) { (void)f; *(c_query *)rec(cb, C_QBEGIN, sizeof(c_query)) = (c_query){q, i, 1}; }
++VK(vkCmdSetBlendConstants, void, VkCommandBuffer cb, const float c[4]) { memcpy(((c_blend *)rec(cb, C_BLEND, sizeof(c_blend)))->c, c, 16); }
++VK(vkCmdClearAttachments, void, VkCommandBuffer cb, uint32_t na, const VkClearAttachment *a, uint32_t nr, const VkClearRect *r) {
++    na = umin(na, 9); c_clratt *c = rec(cb, C_CLRATT, sizeof *c + nr * sizeof(VkClearRect)); c->na = na; c->nr = nr;
++    memcpy(c->a, a, na * sizeof *a); memcpy(c->r, r, nr * sizeof *r);
++}
++VK(vkCmdResolveImage, void, VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageResolve *r) {
++    (void)sl; (void)dl; c_resolve *c = rec(cb, C_RESOLVE, sizeof *c + n * sizeof *r); c->src = src; c->dst = dst; c->n = n; memcpy(c->r, r, n * sizeof *r);
++}
+ VK(vkCmdEndQuery, void, VkCommandBuffer cb, VkQueryPool q, uint32_t i) { *(c_query *)rec(cb, C_QEND, sizeof(c_query)) = (c_query){q, i, 1}; }
+ // Barriers order nothing here: one serial queue, and Metal tracks hazards between the passes and blits it encodes
+ VK(vkCmdPipelineBarrier, void, VkCommandBuffer cb, VkPipelineStageFlags s, VkPipelineStageFlags d, VkDependencyFlags f, uint32_t nm, const VkMemoryBarrier *m,
+@@ -1236,6 +1249,7 @@ static void rec_clear(VkCommandBuffer cb, VkImage im, int ds, const VkClearValue
+     VkBuffer vb[14]; VkDeviceSize vbo[14];
+     VkBuffer ib; VkDeviceSize ibo; MTLIndexType it; uint32_t isz;
+     VkViewport vp; VkRect2D sc; int have_vp, have_sc, vp_dirty, sc_dirty;
++    float blend[4]; uint32_t sref_f, sref_b; int dyn_dirty;   // dynamic blend constants and stencil reference (vkCmdSetBlendConstants / vkCmdSetStencilReference)
+     uint8_t pc[256];
+     subq_t *sq;
+     // The current render pass: its descriptor (attachments created with deferred store actions) and the store actions it ends with; cut = its encoder was ended
+@@ -1281,6 +1295,50 @@ static void resume_rp(rs_t *s) {
+     s->applied = NULL; s->vp_dirty = s->sc_dirty = 1;
+     occ_start(s);
+ }
++// vkCmdClearAttachments inside a render pass (KINGDOM HEARTS FINAL MIX): Metal clears only at the start of a pass, so the pass is split and resumed with a clear load action on the
++// listed attachments. Exact for rects that cover the render target; a smaller rect would clear the whole attachment, so those are skipped (red line)
++static void clear_att(rs_t *s, const c_clratt *x) {
++    if (!s->re && !s->cut) { RED1("vkCmdClearAttachments outside a render pass"); return; }
++    for (uint32_t i = 0; i < x->nr; i++) {
++        const VkRect2D *r = &x->r[i].rect;
++        if (r->offset.x > 0 || r->offset.y > 0 || r->offset.x + (int64_t)r->extent.width < s->rt_w || r->offset.y + (int64_t)r->extent.height < s->rt_h) {
++            RED1("vkCmdClearAttachments of a part of the target (%d,%d %ux%u of %ux%u) not implemented", r->offset.x, r->offset.y, r->extent.width, r->extent.height, s->rt_w, s->rt_h); return;
++        }
++    }
++    if (s->re) end_rp(s, 0);
++    end_blit(s);
++    MTLRenderPassDescriptor *d = s->rpd;
++    for (int i = 0; i < 8; i++) if (d.colorAttachments[i].texture) d.colorAttachments[i].loadAction = MTLLoadActionLoad;
++    if (d.depthAttachment.texture) d.depthAttachment.loadAction = MTLLoadActionLoad;
++    if (d.stencilAttachment.texture) d.stencilAttachment.loadAction = MTLLoadActionLoad;
++    for (uint32_t i = 0; i < x->na; i++) {
++        const VkClearAttachment *a = &x->a[i];
++        if (a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT && a->colorAttachment < 8 && d.colorAttachments[a->colorAttachment].texture) {
++            const float *f = a->clearValue.color.float32; MTLRenderPassColorAttachmentDescriptor *ca = d.colorAttachments[a->colorAttachment];
++            ca.loadAction = MTLLoadActionClear; ca.clearColor = MTLClearColorMake(f[0], f[1], f[2], f[3]);
++        }
++        if (a->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT && d.depthAttachment.texture) { d.depthAttachment.loadAction = MTLLoadActionClear; d.depthAttachment.clearDepth = a->clearValue.depthStencil.depth; }
++        if (a->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT && d.stencilAttachment.texture) { d.stencilAttachment.loadAction = MTLLoadActionClear; d.stencilAttachment.clearStencil = a->clearValue.depthStencil.stencil; }
++    }
++    s->re = [s->cb renderCommandEncoderWithDescriptor:d]; s->cut = 0;
++    s->applied = NULL; s->vp_dirty = s->sc_dirty = 1;
++}
++// vkCmdResolveImage: a Metal pass with no draws that loads the multisampled image and resolves it into the destination on store (whole image: the regions' offsets are not used)
++static void resolve_img(rs_t *s, const c_resolve *x) {
++    if (!x->src->tex || !x->dst->tex) { RED1("a resolved image was not created"); return; }
++    if (s->re) { end_rp(s, 0); s->cut = 1; }
++    end_blit(s);
++    for (uint32_t i = 0; i < x->n; i++) {
++        const VkImageResolve *r = &x->r[i];
++        if (r->srcOffset.x || r->srcOffset.y || r->dstOffset.x || r->dstOffset.y) RED1("vkCmdResolveImage with offsets not implemented (resolving the whole image)");
++        MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor]; MTLRenderPassColorAttachmentDescriptor *ca = d.colorAttachments[0];
++        ca.texture = x->src->tex; ca.slice = r->srcSubresource.baseArrayLayer; ca.level = r->srcSubresource.mipLevel; ca.loadAction = MTLLoadActionLoad;
++        ca.resolveTexture = x->dst->tex; ca.resolveSlice = r->dstSubresource.baseArrayLayer; ca.resolveLevel = r->dstSubresource.mipLevel;
++        ca.storeAction = x->src->samples > 1 ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore;
++        if (x->src->samples <= 1) { RED1("vkCmdResolveImage of a single-sample image: copied"); id<MTLBlitCommandEncoder> be = [s->cb blitCommandEncoder]; [be copyFromTexture:x->src->tex toTexture:x->dst->tex]; [be endEncoding]; continue; }
++        [[s->cb renderCommandEncoderWithDescriptor:d] endEncoding];
++    }
++}
+ static MTLLoadAction load_a(VkAttachmentLoadOp o) { return o == VK_ATTACHMENT_LOAD_OP_CLEAR ? MTLLoadActionClear : o == VK_ATTACHMENT_LOAD_OP_LOAD ? MTLLoadActionLoad : MTLLoadActionDontCare; }
+ static MTLStoreAction store_a(VkAttachmentStoreOp o) { return o == VK_ATTACHMENT_STORE_OP_DONT_CARE ? MTLStoreActionDontCare : MTLStoreActionStore; }
+ static void begin_rp(rs_t *s, const c_brp *c) {
+@@ -1386,7 +1444,11 @@ static int pre_draw(rs_t *s) {
+         s->s_dirty = 1;
+         if (p->has_vp && (!s->applied || !s->applied->has_vp || memcmp(&s->applied->vp, &p->vp, sizeof p->vp))) s->vp_dirty = 1;
+         if (p->has_sc) s->sc_dirty = 1;
+-        s->applied = p;
++        s->applied = p; s->dyn_dirty = 1;
++    }
++    if (s->dyn_dirty) {
++        if (p->dyn_blend) [re setBlendColorRed:s->blend[0] green:s->blend[1] blue:s->blend[2] alpha:s->blend[3]];
++        s->dyn_dirty = 0;
+     }
+     if (s->s_dirty && p->stencil && (p->dyn_sref || p->dyn_smask)) {   // dynamic stencil state, after the pipeline's own
+         if (p->dyn_sref) [re setStencilFrontReferenceValue:s->sdyn_set[2] ? s->sdyn[2][0] : p->sref_f backReferenceValue:s->sdyn_set[2] ? s->sdyn[2][1] : p->sref_b];
+@@ -1576,6 +1638,9 @@ static void replay(rs_t *s, VkCommandBuffer cb) {
+                 }
+                 break;
+             }
++            case C_BLEND: memcpy(s->blend, ((const c_blend *)c)->c, 16); s->dyn_dirty = 1; break;
++            case C_CLRATT: clear_att(s, c); break;
++            case C_RESOLVE: resolve_img(s, c); g_n_copy += ((const c_resolve *)c)->n; break;
+             case C_QEND: s->aq = NULL; if (s->re) [s->re setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0]; break;
+             default: LOG("[vk] [RED] unknown command %u in the command buffer", h->op); return;
+         }
+diff --git a/dm/host/crash.c b/dm/host/crash.c
+index 6f5493c..ff66998 100644
+--- a/dm/host/crash.c
++++ b/dm/host/crash.c
+@@ -191,6 +191,18 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
+         for (int k = 0; k < 6; k++) off("", w[k]);
+         fputc('\n', stderr);
+     }
++    if (getenv("DM_CRASH_AROUND")) {   // diagnostic: 0x200 bytes on each side of the guest-heap addresses the registers hold (what overwrote a heap block)
++        uint64_t done[8]; int nd = 0;
++        for (int i = 0; i < 29 && nd < 8; i++) {
++            uint64_t a = uc->uc_mcontext->__ss.__x[i] & ~0xfull; if (a < 0x7000000000ull || a >= 0x7200000000ull) continue;
++            int dup = 0; for (int j = 0; j < nd; j++) dup |= done[j] == a; if (dup) continue; done[nd++] = a;
++            uint64_t w[128]; vm_size_t got = 0; if (vm_read_overwrite(mach_task_self(), (vm_address_t)(a - 0x200), sizeof w, (vm_address_t)w, &got) != KERN_SUCCESS || got != sizeof w) continue;
++            fprintf(stderr, "[dm] around x%d=%#llx:", i, (unsigned long long)a);
++            for (int k = 0; k < 128; k++) fprintf(stderr, "%s%016llx", k % 4 ? " " : (k == 64 ? "\n[dm] >>" : "\n[dm]   "), (unsigned long long)w[k]);
++            fputc('\n', stderr);
++        }
++    }
++    { extern void dm_heaptrack_scan(void); extern void dm_heaptrack_which(const uint64_t *, int); dm_heaptrack_which((const uint64_t *)uc->uc_mcontext->__ss.__x, 29); dm_heaptrack_scan(); extern void dm_heaptrack_rzscan(void); dm_heaptrack_rzscan(); }
+     dm_backtrace(uc->uc_mcontext->__ss.__fp);
+     // Stack scan: when the frame chain is broken (a return address was overwritten, pc = lr lands on garbage) the backtrace prints nothing; scan 512 words up from sp and list everything that resolves to a module / host symbol (nearest callers first)
+     {   uint64_t sp = uc->uc_mcontext->__ss.__sp;   // The frame just popped (when a return address was overwritten, the bad value and the leftovers of whatever overwrote it sit below sp)
+diff --git a/dm/host/hle_fpslock.c b/dm/host/hle_fpslock.c
+index 0137ad0..636ebd8 100644
+--- a/dm/host/hle_fpslock.c
++++ b/dm/host/hle_fpslock.c
+@@ -22,7 +22,7 @@
+ // frame for two, so a shorter time showed some frames for one (30.4 fps); 30 writes the game's own 33.333 ms
+ // Also: a frame time in ticks as a uint32 (scale / frame rate: 19,200,000 for the Switch's 19.2 MHz system tick), a frame step in seconds as a float (1 / frame rate), and a mode
+ // switch an engine reads before it takes those fields at all (written 1 at any target)
+-enum { FPS_F32, VSYNCS_I32, MS_F32, FPS_I32, TICKS_U32, SECS_F32, MODE_U32, FPS_F64 };
++enum { FPS_F32, VSYNCS_I32, MS_F32, FPS_I32, TICKS_U32, SECS_F32, MODE_U32, FPS_F64, FPS_U8 };
+ #define MS_MARGIN 0.5f
+ static float ms_want(int fps) { return 1000.0f / (float)fps - (fps == 60 ? MS_MARGIN : 0); }
+ typedef struct { const char *build, *what; uint64_t ptr_off; uint32_t field; uint8_t kind, copies; uint32_t scale; uint32_t flag; } lock_t;   // flag: byte offset << 8 | bit mask the object must have set for the write (0: none)
+@@ -32,6 +32,11 @@ static const lock_t k_locks[] = {
+     // at the same speed. The game sets 30 after boot; it also asks for present interval 2, which the profile's present_interval display ignores.
+     // From masagrator's FPSLocker config for this build (FPSLocker-Warehouse, patches/0100B04011742000/C9A3DD7702075ECD.yaml)
+     { "c9a3dd7702075ecd90101f4555389582", "RE Engine frame limit", 0x1295b3f0, 0x434, FPS_F32, 1 },
++    // DRAGON BALL Sparking! ZERO 2.0.73: its DefaultEngine.ini sets bUseFixedFrameRate=True / FixedFrameRate=30: UEngine::UpdateTimeAndHandleMaxTickRate (main+0x40abc6c, vtable slot 0x308) waits for and
++    // steps by 1 / FixedFrameRate, a float at +0x9c8 of the engine (its UPROPERTY params at main+0x88a28f8; bUseFixedFrameRate is bit 6 of +0x9c4), so t.MaxFPS alone (written through the
++    // rewriter's console variables) left it at 30, and raising only the limit would run the game twice as fast. GEngine is main+0x9a2ea20 (bss; FEngineLoop::Tick loads it through the GOT entry
++    // main+0x8d02028 before the call at main+0xa8e8)
++    { "7b53433fa04477fc8a540bd80d5ce665", "Unreal FixedFrameRate", 0x9a2ea20, 0x9c8, FPS_F32, 1 },
+     // Luigi's Mansion 3 1.4.0: Next Level Games' frame limiter. At the end of each frame the main thread calls the frame callbacks (main+0xb7c308) with the milliseconds since the frame
+     // started; the limiter (main+0x7a3e70) runs jobs or sleeps until 33.333 ms have passed, the float at main+0x13c94dc (read only there, at main+0x7a3ea8 and main+0x7a3f18), and the game
+     // steps by the time that really passed. The game asks for present interval 2 too, which the profile's present_interval display ignores; both are needed
+@@ -51,6 +56,15 @@ static const lock_t k_locks[] = {
+     // this row the game keeps 30 fps at the right speed (the simulation at 60 and the regulator at 30: match clock as at 30). The game asks for present interval 2
+     // (BaseDisplaySettings.PresentInterval), which the profile's present_interval display ignores
+     { "a48c0de3bc353efa0e4d359bde05ef24", "FIFA frame regulator", 0xda20e38, 0x8, FPS_F64, 2, 0 },
++    // NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS 1.0.1: CyberConnect2's frame rate, a byte at +0xa02 of the graphics system (the global at main+0x428ad60, read through the GOT
++    // entry main+0x2060c98; the Lua binding ccGetFrameRate main+0x82a7b0 returns it), and the vsyncs per frame at +0x558 the frame loop waits for. Its constructor sets 30
++    // (main+0x10f3588) and SetFrameRate (main+0x10f6438) takes any divisor of 60, storing 60 / fps in +0x558: the engine's own 60 fps mode (the one its online matches exchange with
++    // the PC version), so the game advances by the vsyncs it waits, at the same speed (checked: the tutorial's hold-for-2-seconds counter reads the same at 1.0 s at 30 and at 60 fps).
++    // What paces it: SetFrameRate hands 60 / fps to main+0x10b7590, which stores it at +0x280 of the display object (the global at main+0x4289930, GOT main+0x2079b88); the vsync
++    // thread (main+0x10b9c3c) signals the frame event every that many vsyncs and the frame loop waits for it (main+0x10b9a3c). The two fields above are what the game reads back
++    { "d9c42d45d9850c5804749ed9b44198bf", "CC2 frame rate", 0x428ad60, 0xa02, FPS_U8, 1 },
++    { "d9c42d45d9850c5804749ed9b44198bf", "CC2 vsyncs per frame", 0x428ad60, 0x558, VSYNCS_I32, 1 },
++    { "d9c42d45d9850c5804749ed9b44198bf", "CC2 vsyncs per frame event", 0x4289930, 0x280, VSYNCS_I32, 1 },
+ };
+ #define NLOCKS ((int)(sizeof k_locks / sizeof k_locks[0]))
+ 
+@@ -110,6 +124,41 @@ static void dynamic_resolution_tick(void) {
+         __atomic_store_n(p, 0x3f800000u, __ATOMIC_RELAXED);
+     }
+ }
++// Unreal float console variables the host sets over the device profile's value (same TAutoConsoleVariable layout as dm_ctl_cvar_f32: +0x10 points to the game thread's copy, then the
++// render thread's). The value is the row's, the environment variable overrides it (Documents/env.txt on the phone), 0 leaves the game's own. DRAGON BALL Sparking! ZERO: its
++// SwitchDeviceProfiles.ini renders the 3D scene at r.ScreenPercentage=66.66 of the 1920x1080 output (1280x720); 100 renders it at 1920x1080 (TAutoConsoleVariable at main+0x9a049a0,
++// registered with the name's reference at main+0x3c70128)
++static const struct { const char *build, *what, *env; uint64_t cvar; float value, lo, hi; } k_cvars[] = {
++    { "7b53433fa04477fc8a540bd80d5ce665", "Unreal r.ScreenPercentage", "DM_SCREEN_PERCENTAGE", 0x9a049a0, 100.0f, 25.0f, 200.0f },
++};
++#define NCVARS ((int)(sizeof k_cvars / sizeof k_cvars[0]))
++static int rd(uint64_t a, void *out, size_t n);
++static void cvar_tick(void) {
++    static int state = -2, rows[NCVARS], nrow, nlog[NCVARS]; static float want[NCVARS]; static uint8_t *base;
++    if (state == -1) return;
++    if (state == -2) {
++        state = -1;
++        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
++            for (int k = 0; k < NCVARS; k++) if (!strcmp(g_mod[i].build_id, k_cvars[k].build)) {
++                const char *e = getenv(k_cvars[k].env); float pv = dm_profile()->screen_percentage, v = e ? strtof(e, NULL) : pv ? pv : k_cvars[k].value;   // the profile's screen_percentage, else the row's
++                if (v != 0 && !(v >= k_cvars[k].lo && v <= k_cvars[k].hi)) { LOG("[RED] %s=%s: must be 0 or %g to %g; using %g", k_cvars[k].env, e, k_cvars[k].lo, k_cvars[k].hi, k_cvars[k].value); v = k_cvars[k].value; }
++                if (v == 0) { LOG("main: %s left as the game sets it (%s=0)", k_cvars[k].what, k_cvars[k].env); continue; }
++                want[nrow] = v; rows[nrow++] = k; base = g_mod[i].base;
++            }
++        if (!nrow) return;
++        state = 0;
++    }
++    for (int r = 0; r < nrow; r++) {
++        int k = rows[r]; uint64_t obj;
++        if (!rd((uint64_t)(uintptr_t)(base + k_cvars[k].cvar + 0x10), &obj, sizeof obj) || !obj) continue;   // not registered yet
++        for (int c = 0; c < 2; c++) {
++            float cur, *p = (float *)(uintptr_t)(obj + 4 * (uint64_t)c);
++            if (!rd((uint64_t)(uintptr_t)p, &cur, sizeof cur) || cur == want[r] || !(cur > 0 && cur <= 400)) continue;
++            dm_guest_write_prepare(p, sizeof *p); __atomic_store_n((uint32_t *)p, *(uint32_t *)&want[r], __ATOMIC_RELAXED);
++            if (nlog[r] < 8) { nlog[r]++; LOG("main: %s%s %g → %g (%s)", k_cvars[k].what, c ? " (render thread)" : " (game thread)", cur, want[r], getenv(k_cvars[k].env) ? k_cvars[k].env : "host default"); }
++        }
++    }
++}
+ 
+ // Frostbite's simulation rate, found by name (no fixed addresses, so it holds across a game's updates). Frostbite reflects its settings classes: a class record (its name, then at
+ // +0x40 its field list) and per field a record of 0x20 bytes (name, hash, offset at +0x10, type). SimulationTimeSettings' ForceSimRate (int32) and MaxSimFps (float) cap the
+@@ -252,6 +301,7 @@ int dm_fps_lock_engine(void) { pthread_once(&g_found, lock_find); return nrow ||
+ int nvn_fps_high_now(void);   // hle_nvn.c
+ void dm_fps_lock_tick(void) {
+     dynamic_resolution_tick();   // separate from the FPS cap
++    cvar_tick();
+     static int state = -2, nlog[NLOCKS + 5], target, high; static const char *src;
+     if (state == -1) return;
+     if (state == -2) {
+@@ -309,6 +359,13 @@ void dm_fps_lock_tick(void) {
+         }
+         for (int c = 0; c < L->copies; c++) {
+             uint64_t a = obj + L->field + 4 * (uint64_t)c; uint32_t cur, want; char was[16];
++            if (L->kind == FPS_U8) {   // one byte: read and written alone (its neighbours are other fields)
++                uint8_t b, w8 = (uint8_t)target;
++                if (!rd(a, &b, 1) || b == w8 || b < 10 || b > 60) break;
++                uint8_t *p8 = (uint8_t *)(uintptr_t)a; dm_guest_write_prepare(p8, 1); __atomic_store_n(p8, w8, __ATOMIC_RELAXED);
++                if (nlog[r] < 8) { nlog[r]++; LOG("main: %s %u → %d fps (%s)", L->what, b, target, src); }
++                break;
++            }
+             if (!rd(a, &cur, sizeof cur)) break;
+             if (L->kind == FPS_F32 || L->kind == MS_F32) {
+                 int ms = L->kind == MS_F32; float f, w = ms ? ms_want(target) : (float)target; memcpy(&f, &cur, sizeof f); memcpy(&want, &w, sizeof want);
+@@ -345,6 +402,30 @@ void dm_fps_lock_tick(void) {
+     }
+ }
+ 
++// Output sizes picked from a game's own display mode table (data in main's read-only block, which the loader leaves writable), written before the game runs (main.c): the rows the
++// game uses take the contents of the row for the asked height. The profile's display_height (DM_DISPLAY_HEIGHT overrides; 0 = the game's own).
++// NARUTO X BORUTO Ultimate Ninja STORM CONNECTIONS 1.0.1: 24-byte rows {mode, 0, 0, width, height, 0} at main+0x1ada250 (3840x2160 down to 960x720); the graphics system's init
++// (main+0x10f65ac) takes the row its start parameters name (+0xfc: 15 = 1600x900) and keeps its address at +0x530; mode → size at main+0x10f5b50 sizes the swapchain and the
++// scene targets from it, and the 2D layouts follow the size. Row 10 (1280x720) is rewritten too, for a start that names it
++static const struct { const char *build, *what; uint64_t table; uint32_t stride; int8_t dst[2]; struct { uint16_t h; int8_t row; } m[3]; } k_res[] = {
++    { "d9c42d45d9850c5804749ed9b44198bf", "display mode table", 0x1ada250, 24, {15, 10}, {{720, 10}, {900, 15}, {1080, 8}} },
++};
++#define NRES ((int)(sizeof k_res / sizeof k_res[0]))
++void dm_game_res_apply(void) {
++    const char *e = getenv("DM_DISPLAY_HEIGHT"); int h = e ? atoi(e) : dm_profile()->display_height;
++    if (!h) return;
++    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
++        for (int k = 0; k < NRES; k++) if (!strcmp(g_mod[i].build_id, k_res[k].build)) {
++            int src = -1; for (int j = 0; j < 3; j++) if (k_res[k].m[j].h == h) src = k_res[k].m[j].row;
++            if (src < 0) { LOG("[RED] DM_DISPLAY_HEIGHT=%d: this game takes 720, 900 or 1080; keeping its own size", h); return; }
++            uint8_t *t = g_mod[i].base + k_res[k].table, row[64]; uint32_t n = k_res[k].stride;
++            memcpy(row, t + (size_t)src * n, n);
++            for (int d = 0; d < 2; d++) { uint8_t *p = t + (size_t)k_res[k].dst[d] * n; dm_guest_write_prepare(p, n); memcpy(p, row, n); }
++            uint32_t w[6]; memcpy(w, row, sizeof w);
++            LOG("main: %s: rows %d and %d → %ux%u (%s)", k_res[k].what, k_res[k].dst[0], k_res[k].dst[1], w[3], w[4], e ? "DM_DISPLAY_HEIGHT" : "game profile display_height");
++        }
++}
++
+ // The Mac's DM_CTL "cvarf <main offset> <value>" (hle_hid.c), for trying an Unreal console variable while the game runs: the TAutoConsoleVariable at main+offset holds at +0x10
+ // the pointer to its value, the game thread's copy then the render thread's; both are set to the float
+ void dm_ctl_cvar_f32(uint64_t off, float v) {
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index 2e72d0b..5d0e95a 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -435,7 +435,14 @@ static int host_path_ex(const char *p, char *out, size_t n, int *ro, int create)
+     for (int i = 0; i < g_nmnt; i++) {
+         if (!mnt_is(&g_mnt[i], p, ln)) continue;
+         if (ro) *ro = g_mnt[i].ro;
+-        char normed[1024]; const char *rest = c + 1;
++        char normed[1024], fwd[1024]; const char *rest = c + 1;
++        // Windows separators: KINGDOM HEARTS -HD 1.5+2.5 ReMIX- (a PC port) builds its save paths as "save:\KINGDOM HEARTS HD 1.5+2.5 ReMIX\KHFM.png" and
++        // "save:\KINGDOM HEARTS HD 1.5+2.5 ReMIX/config1525.dat"; taken literally the first became one file at the save root and the folder of the second never existed
++        if (strchr(rest, '\\')) {
++            if (strlcpy(fwd, rest, sizeof fwd) >= sizeof fwd) { errno = ENAMETOOLONG; return 0; }
++            for (char *q = fwd; *q; q++) if (*q == '\\') *q = '/';
++            rest = fwd;
++        }
+         if (strstr(rest, "/.")) { if (!norm_rest(rest, normed, sizeof normed)) return 0; rest = normed; }   // only paths with "." components are normalized; the rest walk component by component as before
+         if (g_mnt[i].overlay[0] && !create) return rom_overlay_path(&g_mnt[i], rest, out, n);
+         strlcpy(out, g_mnt[i].dir, n);
+@@ -859,7 +866,7 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
+       atomic_store(&g_ftxn[fd], token); }
+     fslog_init();
+     if (g_fslog && fd < 4096) { pthread_mutex_lock(&g_fslog_lock); free(g_fdpath[fd]); g_fdpath[fd] = strdup(path); pthread_mutex_unlock(&g_fslog_lock); }
+-    if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
++    if (g_flag.fs) { uint32_t thr_cur_handle(void); LOG("fs open [%.2fs] T=%x %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, thr_cur_handle(), path, mode, fd); }
+     return RES_OK;
+ }
+ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) { dm_thread_service_request(); h = FH_IN(h);
+@@ -1136,10 +1143,20 @@ HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → close
+ 
+ // ---------- Overloads from newer SDKs (SDK 16: MountRom without a cache, ReadFile without the bytes-read output / with read options, directory entry count) ----------
+ HLE_FORCE("_ZN2nn2fs8MountRomEPKc", "fsp-srv; rom → host RomFS directory (overload without the cache arguments)", Result, h_fs_MountRom1, const char *name) { return h_fs_MountRom(name, NULL, 0); }
+-// SDK 19 (Metroid Prime 4: Beyond): MountRom and QueryMountRomCacheSize with an int after the first argument (the program index); the host has one RomFS, so it is ignored
+-HLE_FORCE("_ZN2nn2fs8MountRomEPKciPvm", "fsp-srv; rom → host RomFS directory (SDK 19 overload with an index)", Result, h_fs_MountRomIdx, const char *name, int idx, void *cache, size_t sz) {
+-    if (idx) LOG("[RED] fs::MountRom(%s, program index %d): the host has one RomFS, this program's", name, idx);
+-    return h_fs_MountRom(name, cache, sz);
++// The RomFS of another program of a multi-program application (KINGDOM HEARTS -HD 1.5+2.5 ReMIX-: each game mounts the menu's, program 0, as rom0): DM_ROMFS_P<index>,
++// else romfs_p<index>.img beside DM_ROMFS (the app's own RomFS); missing, it answers "target not found"
++HLE_FORCE("_ZN2nn2fs8MountRomEPKciPvm", "fsp-srv; another program's RomFS → DM_ROMFS_P<index> or romfs_p<index>.img beside the game's", Result, h_fs_MountRomProgram, const char *name, int index, void *cache, size_t sz) {
++    (void)cache; (void)sz; char var[32], p[1024], b[1024]; struct stat st;
++    snprintf(var, sizeof var, "DM_ROMFS_P%d", index);
++    if (getenv(var)) strlcpy(p, getenv(var), sizeof p);
++    else {
++        strlcpy(b, envdir("DM_ROMFS", "romfs", p, sizeof p), sizeof b);
++        char *s = strrchr(b, '/'); if (s) *s = 0; else strlcpy(b, ".", sizeof b);
++        snprintf(p, sizeof p, "%s/romfs_p%d.img", b, index);
++    }
++    if (stat(p, &st)) { LOG("[RED] fs MountRom(%s, program %d): %s not found (set %s)", name, index, p, var); return RES_TARGET_NOT_FOUND; }
++    LOG("fs MountRom(%s, program %d) → %s", name, index, p);
++    return mount(name, p, 1);
+ }
+ HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPmi", "fsp-srv; the cache gets only the minimum size (SDK 19 overload with an index)", Result, h_fs_QueryRomCacheIdx, size_t *out, int idx) { (void)idx; return h_fs_QueryRomCache(out); }
+ // ReadFile without the bytes-read output: the read must be complete; a short read (past the end of file) is returned as a failure
+diff --git a/dm/host/hle_movie.c b/dm/host/hle_movie.c
+index d04639b..4f92958 100644
+--- a/dm/host/hle_movie.c
++++ b/dm/host/hle_movie.c
+@@ -862,7 +862,7 @@ static int md_out_tex(mdec_t *d, int i, void *buf) {
+     if (!p || cap < 8) { LOG("[RED] movie: client buffer in native-texture mode is %zu bytes, needs 8 (a texture object)", cap); return 0x100b; }
+     void *tex = p; int tw = 0, th = 0, f = nvn_host_write_texture(tex, NULL, 0, 0, 0, &tw, &th);
+     if (f < 0) { LOG("[RED] movie: buffer data %p in native-texture mode is not a texture object", tex); return 0x100b; }
+-    int bgr = f >= 0x99 && f <= 0x9C;   // BGRX8, BGRA8 and their sRGB forms (TRIANGLE STRATEGY): the SDK's consumer draws into the texture on the GPU, so the bytes follow its format
++    int bgr = f >= 0x99 && f <= 0x9C;   // BGRX8, BGRA8 and their sRGB forms (TRIANGLE STRATEGY): the SDK's consumer draws into the texture on the GPU, so the bytes follow its format (DRAGON BALL Sparking! ZERO's movies are BGRX8, 0x9a: written in RGBA order they came out blue and yellow)
+     if (f != 0x25 && f != 0x38 && f != 0x6d && f != 0x37 && !bgr && !d->red_img++) LOG("[RED] movie: client texture format %#x is not RGBA8 / RGBX8 / BGRA8 / BGRX8 (sRGB included), writing in RGBA byte order", f);   // Metroid Dread: RGBX8_SRGB
+     int w = d->w < tw ? d->w : tw, h = d->h < th ? d->h : th;
+     // No picture (an end-of-stream output): nothing is drawn and the texture keeps the last frame, as the SDK's consumer has no frame to draw. A black frame here flashed at the
+diff --git a/dm/host/hle_profile.c b/dm/host/hle_profile.c
+index dd7ef64..a3d66db 100644
+--- a/dm/host/hle_profile.c
++++ b/dm/host/hle_profile.c
+@@ -163,6 +163,7 @@ static void defaults(void) {
+ #endif
+     P.stdalloc_cap = DM_GAME_STDALLOC_CAP; P.shader_skip_off = DM_GAME_SHADER_KEY_SKIP_OFF; P.shader_skip_len = DM_GAME_SHADER_KEY_SKIP_LEN;
+     P.tex_bc_cpu = DM_GAME_TEX_BC_CPU; P.ue_texture_pool = DM_GAME_UE_TEXTURE_POOL; P.enc_thread = DM_GAME_ENC_THREAD; P.draw_barriers_game = DM_GAME_DRAW_BARRIERS_GAME;
++    P.present_hz = DM_GAME_PRESENT_HZ; P.display_height = DM_GAME_DISPLAY_HEIGHT; P.screen_percentage = strtof(DM_GAME_SCREEN_PERCENTAGE, NULL);
+     copy_str(P.args, sizeof P.args, DM_GAME_ARGS);
+     copy_str(P.genv, sizeof P.genv, DM_GAME_ENV);
+     copy_str(P.source, sizeof P.source, "compiled game_profile.h");
+@@ -233,6 +234,9 @@ static void set_kv(const char *k, const char *v) {
+     else if (!strcmp(k, "ue_texture_pool")) P.ue_texture_pool = (int)num(v, (uint64_t)P.ue_texture_pool);
+     else if (!strcmp(k, "enc_thread")) P.enc_thread = truthy(v);
+     else if (!strcmp(k, "draw_barriers")) P.draw_barriers_game = !strcmp(v, "game") || !strcmp(v, "1");
++    else if (!strcmp(k, "present_hz")) P.present_hz = (int)num(v, (uint64_t)P.present_hz);
++    else if (!strcmp(k, "display_height")) P.display_height = (int)num(v, (uint64_t)P.display_height);
++    else if (!strcmp(k, "screen_percentage")) P.screen_percentage = strtof(v, NULL);
+     else if (!strcmp(k, "game_args")) copy_str(P.args, sizeof P.args, v);
+     else if (!strcmp(k, "game_env")) copy_str(P.genv, sizeof P.genv, v);
+     // any other key (ipa, zip_store, shader_*, build, package, ...) is not a host constant: ignored
+diff --git a/dm/host/hle_profile.h b/dm/host/hle_profile.h
+index 9871608..8dc064d 100644
+--- a/dm/host/hle_profile.h
++++ b/dm/host/hle_profile.h
+@@ -33,6 +33,8 @@ struct dm_profile {
+     uint64_t stdalloc_cap;       // StandardAllocator's address space (hle_svc.c); 0 = what the alias region has room for
+     uint32_t shader_skip_off, shader_skip_len;   // shader_key_skip <offset>+<length>: control bytes the shader keys hash as zeros (len 0 = none)
+     int tex_bc_cpu, ue_texture_pool, enc_thread, draw_barriers_game;   // ue_texture_pool in MB (0 = the game's own pool)
++    int present_hz, display_height;   // present_hz: 60, or 120 for a game that steps by real time (hle_nvn.c); display_height: the output size row of the game's display mode table, 0 = its own (hle_fpslock.c)
++    float screen_percentage;     // Unreal r.ScreenPercentage the host sets over the device profile's (hle_fpslock.c cvar_tick); 0 = the game's own
+     char args[512], genv[1024];  // game_args / game_env
+     char source[512];            // DM_PROFILE, or "compiled defaults"
+ };
+diff --git a/dm/host/hle_svc.c b/dm/host/hle_svc.c
+index 5346111..6a33785 100644
+--- a/dm/host/hle_svc.c
++++ b/dm/host/hle_svc.c
+@@ -948,8 +948,8 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
+         int k = map_find(dst, size);
+         if (!k || g_map[k - 1].base != dst || g_map[k - 1].size != size || g_map[k - 1].src != src) {
+             pthread_mutex_unlock(&g_map_lock); LOG("UnmapMemory does not match a mapping %#llx+%#llx", dst, size); regs[0] = 0xD401; return 0; }
+-        dm_guest_write_prepare((void *)src, size);
+-        memcpy((void *)src, (void *)dst, size);
++        { static int nocopy = -1; if (nocopy < 0) nocopy = getenv("DM_UNMAP_NOCOPY") != NULL; if (g_flag.svc) LOG("UnmapMemory %#llx -> %#llx +%#llx%s", dst, src, size, nocopy ? " (not copied back)" : "");
++          if (!nocopy) { dm_guest_write_prepare((void *)src, size); memcpy((void *)src, (void *)dst, size); } }
+         map_del(k - 1);
+         pthread_mutex_unlock(&g_map_lock);
+         regs[0] = 0; return 0;
+diff --git a/dm/host/hle_thread.c b/dm/host/hle_thread.c
+index 5857dc7..ff94d3b 100644
+--- a/dm/host/hle_thread.c
++++ b/dm/host/hle_thread.c
+@@ -370,7 +370,42 @@ static void qos_apply(thr_t *t) {   // on the thread itself, holding G (prio and
+ }
+ // A host helper thread (audio notify / silent sink, vsync, movie decode) created from a guest thread inherits that thread's class; under DM_QOS_MAP it sets its own instead
+ void dm_host_helper_qos(qos_class_t q) { if (g_qos_map) pthread_set_qos_class_self_np(q, 0); }
++// DM_CORELOCK=1 (experiment): on Horizon a thread pinned to one core runs only while that core is its; threads of equal priority on a core are not time-sliced and switch only when one
++// blocks. Code that leaves shared state unlocked between such threads is safe there and races here, where every guest thread runs in parallel. With the switch on, a game thread
++// whose affinity is one core holds that core's lock while it runs guest code and lets it go in the SVCs that block (sleep / yield, waits, lock arbitration)
+ static const char *thr_name(thr_t *t, char *buf, size_t n);
++// DM_CORELOCK=1: every such thread; DM_CORELOCK=<name>,<name>…: only threads whose name contains one of them (a thread blocked in host code, not in an SVC, would hold its core)
++static const char *g_cl_names;
++static int corelock_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_CORELOCK"); on = e && *e && strcmp(e, "0") != 0; if (on && strcmp(e, "1")) g_cl_names = e;
++    if (on) LOG("DM_CORELOCK: threads pinned to one core run one at a time per core (%s)", g_cl_names ? g_cl_names : "all of them"); } return on; }
++static __thread int tl_cl_match = -1;   // this thread's name matched the list: -1 not decided yet (no name)
++static int cl_wanted(thr_t *t) {
++    if (!g_cl_names) return 1;
++    if (tl_cl_match >= 0) return tl_cl_match;
++    char nb[64]; const char *nm = thr_name(t, nb, sizeof nb); if (!nm || !*nm) return 0;
++    // entries are name parts; one starting with '-' excludes the threads whose name has it (a list of exclusions only takes every other thread)
++    int inc = 0, exc = 0, any_inc = 0; const char *p = g_cl_names;
++    while (*p) { const char *q = strchr(p, ','); size_t l = q ? (size_t)(q - p) : strlen(p); char w[64]; if (l >= sizeof w) l = sizeof w - 1; memcpy(w, p, l); w[l] = 0;
++        if (w[0] == '-') { if (w[1] && strstr(nm, w + 1)) exc = 1; } else if (l) { any_inc = 1; if (strstr(nm, w)) inc = 1; }
++        p = q ? q + 1 : p + l; }
++    return tl_cl_match = !exc && (inc || !any_inc);
++}
++static pthread_mutex_t g_core_mu[4] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
++static __thread int tl_core_held = -1;
++static thr_t *g_core_holder[4];
++static void cl_acquire(thr_t *t) {
++    static int global = -1; if (global < 0) global = getenv("DM_CORELOCK_GLOBAL") != NULL;   // one lock for every core: one guest thread at a time
++    if (!corelock_on() || !t || t->host_owned || !t->mask || (!global && (t->mask & (t->mask - 1))) || !cl_wanted(t)) return;
++    int c = global ? 0 : __builtin_ctzll(t->mask); if (c > 3 || tl_core_held == c) return;
++    if (tl_core_held >= 0) { g_core_holder[tl_core_held] = NULL; pthread_mutex_unlock(&g_core_mu[tl_core_held]); tl_core_held = -1; }
++    for (int i = 0; ; i++) {
++        if (!pthread_mutex_trylock(&g_core_mu[c])) { tl_core_held = c; g_core_holder[c] = t; return; }
++        if (global && i == 200) return;   // global: a holder kept it 20 ms, it waits in host code; go on without it and try again at the next SVC
++        if (i == 20000) { thr_t *h = g_core_holder[c]; LOG("DM_CORELOCK: thread %#x waits 2 s for core %d, held by %#x (last svc %#x lr=%#llx)", t->handle, c, h ? h->handle : 0, h ? h->last_svc : -1, h ? (unsigned long long)h->last_lr : 0ull); }
++        struct timespec ts = {0, 100000}; nanosleep(&ts, NULL);
++    }
++}
++static void cl_release(void) { if (tl_core_held >= 0) { g_core_holder[tl_core_held] = NULL; pthread_mutex_unlock(&g_core_mu[tl_core_held]); tl_core_held = -1; } }
+ static void *thread_main(void *p) {
+     thr_t *t = p;
+     pthread_setspecific(g_keythr, t);
+@@ -389,6 +424,7 @@ static void *thread_main(void *p) {
+     if (atomic_load(&g_teardown_park)) teardown_exit_locked(t);
+     t->entered = 1; pthread_mutex_unlock(&G);
+     { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, thr_name(t, nb, sizeof nb)); pthread_setname_np(hn); }   // the guest's name (set before StartThread) for sample / Instruments
++    cl_acquire(t);
+     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
+     die("guest thread entry returned");
+ }
+@@ -403,6 +439,7 @@ static void thr_free(thr_t *t) {   // Holding G; unlink from the all-threads cha
+ }
+ static void wake_sync_waiters(const void *obj);
+ static void thread_exit(thr_t *t) {
++    cl_release();
+     t->exit_ns = now_ns(); t->exit_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
+     // No logging here: the exit happens on the guest thread's own stack (some are only a dozen or so KiB), and a printf with floating point would blow the stack (real-device smoke test: SIGBUS when LibcurlResolver exits, backtrace fprintf → __dtoa). Only the time is recorded, and it is printed later in the state dump
+     pthread_mutex_lock(&G);
+@@ -1058,11 +1095,30 @@ void dm_guest_cond_wait_ns(pthread_cond_t *c, pthread_mutex_t *m, int64_t ns) {
+     pthread_cond_timedwait_relative_np(c, m, &ts);
+     if (me) me->sleeping = 0;
+ }
++// DM_TLS_CHECK=1 (diagnostic): at every SVC, compare this thread's guest tpidr_el0 and tpidrro_el0 values with those last seen on the other threads; a value two live threads share
++// means their thread-local data is one block
++static void tls_check(thr_t *me) {
++    static int on = -1; if (on < 0) on = getenv("DM_TLS_CHECK") != NULL; if (!on || !me) return;
++    enum { N = 256 }; static struct { thr_t *t; uint64_t tls, tlr; } seen[N]; static int n, logged; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
++    uint64_t tls = (uint64_t)(uintptr_t)pthread_getspecific(g_keytls), tlr = (uint64_t)(uintptr_t)pthread_getspecific(g_keytlr);
++    pthread_mutex_lock(&mu);
++    int k = -1; for (int i = 0; i < n; i++) if (seen[i].t == me) k = i;
++    if (k < 0 && n < N) { k = n++; seen[k].t = me; }
++    if (k >= 0) { seen[k].tls = tls; seen[k].tlr = tlr;
++        for (int i = 0; i < n && logged < 20; i++) if (i != k && !seen[i].t->exited && ((tls && seen[i].tls == tls) || (tlr && seen[i].tlr == tlr))) {
++            char a[64], b[64]; logged++; LOG("[RED] TLS shared: thread %#x (%s) and %#x (%s): tpidr_el0 %#llx / %#llx, tpidrro_el0 %#llx / %#llx", me->handle, thr_name(me, a, sizeof a), seen[i].t->handle, thr_name(seen[i].t, b, sizeof b),
++                (unsigned long long)tls, (unsigned long long)seen[i].tls, (unsigned long long)tlr, (unsigned long long)seen[i].tlr); } }
++    pthread_mutex_unlock(&mu);
++}
+ int svc_thread(int num, uint64_t *regs) {
+     thr_t *me = pthread_getspecific(g_keythr);
++    tls_check(me);
+     if (me && atomic_load(&g_teardown_park)) { pthread_mutex_lock(&G); teardown_exit_locked(me); }
++    int blocks = tl_core_held >= 0 && (num == 0x0B || num == 0x18 || num == 0x1A || num == 0x1C || num == 0x34 || num == 0x0F);
++    if (blocks) cl_release();
+     int r = svc_thread_impl(num, regs);
+     if (me && atomic_load(&g_teardown_park)) { pthread_mutex_lock(&G); teardown_exit_locked(me); }
++    if (corelock_on() && num != 0x0A) cl_acquire(me);   // after any SVC (also the threads that run without the core, the main thread included)
+     // The default path hands off only after a wake. The optional broader mode
+     // also checks peers that were already runnable, without serializing every
+     // game's SVCs behind unrelated busy workers by default.
+diff --git a/dm/host/main.c b/dm/host/main.c
+index 959430e..ee8f525 100644
+--- a/dm/host/main.c
++++ b/dm/host/main.c
+@@ -184,6 +184,7 @@ int main(int argc, char **argv) {
+         LOG("host loading already finished early in the background (dm_host_preload_start)");
+     } else host_preload(argc, argv);
+     { void dm_fps_state_apply(void); dm_fps_state_apply(); }   // frame rate and render scale into the frame step state page (loader.c): the iOS launcher sets them after the loading began
++    { void dm_game_res_apply(void); dm_game_res_apply(); }   // a game's output size in its own display mode table (hle_fpslock.c k_res), before it reads it
+     front_run(guest_main);
+     return 0;
+ }
+diff --git a/dm/host/probe.c b/dm/host/probe.c
+index b2804f6..0b0060e 100644
+--- a/dm/host/probe.c
++++ b/dm/host/probe.c
+@@ -139,6 +139,7 @@ static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the
+             int dr = (g_probe[i].dump >> 25) & 31;                                    // @xN+offset: based on xN
+             uint64_t at = uc->uc_mcontext->__ss.__x[dr] + (g_probe[i].dump & 0xffffff);
+             if (g_probe[i].dump & 0x1000000) { uint64_t p = 0; vm_size_t g = 0; if (!vm_read_overwrite(mach_task_self(), at, 8, (vm_address_t)&p, &g) && p) at = p + g_probe[i].dpost; else at = 0; }   // @*offset[+post]: dereference first, then dump (post bytes further on)
++            if (at && getenv("DM_PROBE_DUMPTXT")) { char t[97] = {0}; vm_size_t g2 = 0; if (!vm_read_overwrite(mach_task_self(), at, 96, (vm_address_t)t, &g2)) { for (int k = 0; k < 96; k++) if (t[k] && (t[k] < 32 || t[k] > 126)) t[k] = '.'; fprintf(stderr, " txt=\"%s\"", t); } }
+             if (at && !vm_read_overwrite(mach_task_self(), at, 16, (vm_address_t)b, &got) && got == 16) {
+                 fprintf(stderr, " [%sx%d+%#lx]", (g_probe[i].dump & 0x1000000) ? "*" : "", dr, g_probe[i].dump & 0xffffff);
+                 if (g_probe[i].dpost) fprintf(stderr, "+%#lx", g_probe[i].dpost);
+@@ -372,7 +373,167 @@ static void watch_install(void) {
+ 
+ #endif
+ 
++#if !TARGET_OS_IPHONE   // DM_HEAPTRACK is a Mac diagnostic (it needs the probes above)
++// DM_HEAPTRACK=<module>:<a|f|r><offset hex>/<register>[/<old register>],… (diagnostic): live-pointer set of one allocator. 'a' = an allocation returned the pointer in the register,
++// 'f' = the pointer is being freed, 'r' = a reallocation returned the new pointer (the old one in the second register). An allocation of a pointer already live, or a free of one
++// that is not, is printed with a backtrace (a double free: two owners of one block). NARUTO X BORUTO STORM CONNECTIONS: Scaleform's heap free lists held another object's data
++typedef struct { uint64_t at; char kind; int reg, oreg; } ht_site;
++// DM_HEAPTRACK_POISON: entries 's<offset>/<size register>' record the requested size at an allocation function's entry (per thread, taken by the next 'a' on that thread);
++// a free then fills the block's inside [0x30, size − 0x10) with 0xF00DF00D and remembers where it came from; the crash report lists freed blocks whose fill changed (written after free)
++typedef struct { uint64_t p, size, lr[6]; uint8_t save[0x200]; } ht_freed;
++#define HT_NFREED 65536
++static ht_freed g_htf[HT_NFREED]; static uint64_t g_htf_n;
++static __thread uint64_t tl_ht_size;
++static uint64_t g_watch[256]; static int g_nwatch;
++static __thread uint64_t tl_ht_rp, tl_ht_rs;   // reallocation in progress on this thread: old pointer, new size
++#define HT_SCAP (1u << 22)
++static uint64_t *g_hts_k, *g_hts_v;   // live pointer → requested size
++static uint64_t (*g_hts_lr)[4];       // and the allocation's callers
++// Overlap check (DM_HEAPTRACK_POISON): every live block with its size in one array (index kept beside the size), so a new block that overlaps a live one is caught as it is handed out
++typedef struct { uint64_t p, size; } ht_live;
++static ht_live *g_hl; static uint64_t g_hl_n; static uint32_t *g_hl_idx;   // g_hl_idx[size-table slot] = index + 1
++static void hl_lr_print(const uint64_t *lr) { ht_freed f = {0}; memcpy(f.lr, lr, 32); void ht_print_lr(const ht_freed *); ht_print_lr(&f); }
++
++
++static ht_site g_hts[16]; static int g_nhts; static pthread_mutex_t g_ht_mu = PTHREAD_MUTEX_INITIALIZER;
++#define HT_CAP (1u << 22)
++static uint64_t *g_ht; static uint64_t g_ht_n, g_ht_bad;
++static uint64_t *ht_slot(uint64_t k) { uint64_t h = (k >> 4) * 0x9E3779B97F4A7C15ull; for (uint64_t i = h >> 42;; i = (i + 1) & (HT_CAP - 1)) if (g_ht[i] == k || !g_ht[i]) return &g_ht[i]; }
++static void ht_del(uint64_t k) {   // backward-shift deletion
++    uint64_t *s = ht_slot(k); if (!*s) return; uint64_t i = (uint64_t)(s - g_ht); *s = 0;
++    for (uint64_t j = (i + 1) & (HT_CAP - 1); g_ht[j]; j = (j + 1) & (HT_CAP - 1)) { uint64_t v = g_ht[j]; g_ht[j] = 0; *ht_slot(v) = v; }
++}
++static void ht_report(const char *what, uint64_t p, ucontext_t *uc) {
++    if (g_ht_bad++ >= 40) return;
++    extern uint64_t g_t0_ns; uint64_t now_ns(void); uint32_t thr_cur_handle(void);
++    fprintf(stderr, "[dm] HEAPTRACK %s %#llx [%.4fs] T=%x pc=%#llx lr=%#llx live=%llu\n", what, (unsigned long long)p, (now_ns() - g_t0_ns) / 1e9, thr_cur_handle(),
++            (unsigned long long)uc->uc_mcontext->__ss.__pc, (unsigned long long)uc->uc_mcontext->__ss.__lr, (unsigned long long)g_ht_n);
++    dm_backtrace(uc->uc_mcontext->__ss.__fp);
++}
++static uint64_t *hs_slot(uint64_t k) { uint64_t h = (k >> 4) * 0x9E3779B97F4A7C15ull; for (uint64_t i = h >> 42;; i = (i + 1) & (HT_SCAP - 1)) if (g_hts_k[i] == k || !g_hts_k[i]) return &g_hts_k[i]; }
++static int ht_poison(void) { static int on = -1; if (on < 0) on = getenv("DM_HEAPTRACK_POISON") != NULL; return on; }
++void ht_print_lr(const ht_freed *f) {
++    for (int j = 0; j < 6 && f->lr[j]; j++) { module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (f->lr[j] >= (uint64_t)g_mod[i].base && f->lr[j] < (uint64_t)g_mod[i].base + g_mod[i].size) m = &g_mod[i];
++        if (m) fprintf(stderr, " %s+%#llx", m->name, (unsigned long long)(f->lr[j] - (uint64_t)m->base)); else fprintf(stderr, " %#llx", (unsigned long long)f->lr[j]); }
++}
++void dm_heaptrack_which(const uint64_t *x, int n) {   // crash.c: the last free of the block each register points into
++    if (!ht_poison() || !g_hts_k) return;
++    for (int r = 0; r < n; r++) { uint64_t best = 0, bi = 0;   // a live block holding it: who allocated it
++        if (x[r] < 0x7000000000ull || x[r] >= 0x7200000000ull) continue;
++        for (uint64_t i = 0; i < HT_SCAP; i++) { uint64_t p = g_hts_k[i]; if (p && *ht_slot(p) && p <= x[r] && x[r] < p + g_hts_v[i] && p > best) { best = p; bi = i; } }
++        if (best) { fprintf(stderr, "[dm] HEAPTRACK x%d=%#llx is +%#llx in LIVE block %#llx size %#llx allocated from", r, (unsigned long long)x[r], (unsigned long long)(x[r] - best), (unsigned long long)best, (unsigned long long)g_hts_v[bi]);
++            ht_freed f = {0}; memcpy(f.lr, g_hts_lr[bi], 32); ht_print_lr(&f); fputc('\n', stderr); } }
++    uint64_t m = g_htf_n < HT_NFREED ? g_htf_n : HT_NFREED;
++    for (int r = 0; r < n; r++) for (uint64_t k = 0; k < m; k++) {
++        ht_freed *f = &g_htf[(g_htf_n - 1 - k) % HT_NFREED];
++        if (f->p && x[r] >= f->p && x[r] < f->p + f->size) { fprintf(stderr, "[dm] HEAPTRACK x%d=%#llx is +%#llx in block %#llx size %#llx freed from", r, (unsigned long long)x[r], (unsigned long long)(x[r] - f->p), (unsigned long long)f->p, (unsigned long long)f->size); ht_print_lr(f); fputc('\n', stderr);
++            uint64_t o = x[r] - f->p; if (o < sizeof f->save) { fprintf(stderr, "[dm]   before free at +%#llx:", (unsigned long long)o); for (uint64_t k = o; k < o + 0x40 && k + 8 <= sizeof f->save; k += 8) fprintf(stderr, " %016llx", (unsigned long long)*(uint64_t *)(f->save + k));
++                uint64_t sp = *(uint64_t *)(f->save + (o + 0x10 < sizeof f->save - 8 ? o + 0x10 : 0)) & ~3ull; char str[96] = {0}; vm_size_t g = 0;
++                if (sp > 0x1000 && !vm_read_overwrite(mach_task_self(), (vm_address_t)(sp + 0xc), sizeof str - 1, (vm_address_t)str, &g)) { for (int i = 0; i < 95; i++) if (str[i] && (str[i] < 32 || str[i] > 126)) str[i] = '.'; fprintf(stderr, " | [+0x10]→ \"%s\"", str); }
++                fputc('\n', stderr); }
++            break; }
++    }
++}
++void dm_heaptrack_rzscan(void) {
++    if (!getenv("DM_HEAPTRACK_REDZONE") || !g_hl) return; int shown = 0;
++    for (uint64_t i = 0; i < g_hl_n && shown < 10; i++) { const uint8_t *c = (const uint8_t *)(g_hl[i].p + g_hl[i].size); int bad = -1; vm_size_t g = 0; uint8_t cc[64];
++        if (vm_read_overwrite(mach_task_self(), (vm_address_t)c, 64, (vm_address_t)cc, &g)) continue; for (int j = 0; j < 64; j++) if (cc[j] != 0xCB) { bad = j; break; }
++        if (bad >= 0) { uint64_t *k = hs_slot(g_hl[i].p); shown++; fprintf(stderr, "[dm] HEAPTRACK live block %#llx size %#llx overflowed at +%d:", (unsigned long long)g_hl[i].p, (unsigned long long)g_hl[i].size, bad);
++            for (int j = 0; j < 32; j++) fprintf(stderr, " %02x", cc[j]); fprintf(stderr, "; allocated from"); if (*k) hl_lr_print(g_hts_lr[k - g_hts_k]); fputc('\n', stderr); } }
++    fprintf(stderr, "[dm] HEAPTRACK redzone scan: %llu live blocks, %d overflowed\n", (unsigned long long)g_hl_n, shown);
++}
++void dm_heaptrack_scan(void) {   // crash.c: freed blocks whose fill changed
++    if (!ht_poison() || !g_hts_k) return; int shown = 0;
++    uint64_t n = g_htf_n < HT_NFREED ? g_htf_n : HT_NFREED;
++    for (uint64_t k = 0; k < n && shown < 12; k++) {
++        ht_freed *f = &g_htf[(g_htf_n - 1 - k) % HT_NFREED]; if (!f->p) continue;
++        for (uint64_t o = 0x30; o + 0x10 + 8 <= f->size; o += 8) {
++            uint64_t v = *(uint64_t *)(f->p + o);
++            if (v != 0xF00DF00DF00DF00Dull) {
++                // still free? (allocated again, its fill legitimately changed: then it is live in the set)
++                if (*ht_slot(f->p)) break;
++                fprintf(stderr, "[dm] HEAPTRACK freed block %#llx size %#llx written at +%#llx: %016llx %016llx %016llx %016llx; freed from", (unsigned long long)f->p, (unsigned long long)f->size, (unsigned long long)o,
++                        (unsigned long long)v, (unsigned long long)((uint64_t *)(f->p + o))[1], (unsigned long long)((uint64_t *)(f->p + o))[2], (unsigned long long)((uint64_t *)(f->p + o))[3]);
++                for (int j = 0; j < 6 && f->lr[j]; j++) { module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (f->lr[j] >= (uint64_t)g_mod[i].base && f->lr[j] < (uint64_t)g_mod[i].base + g_mod[i].size) m = &g_mod[i];
++                    if (m) fprintf(stderr, " %s+%#llx", m->name, (unsigned long long)(f->lr[j] - (uint64_t)m->base)); else fprintf(stderr, " %#llx", (unsigned long long)f->lr[j]); }
++                fputc('\n', stderr); shown++; break;
++            }
++        }
++    }
++    fprintf(stderr, "[dm] HEAPTRACK scan: %llu frees recorded, %d written after free\n", (unsigned long long)g_htf_n, shown);
++}
++static void ht_hit(ucontext_t *uc) {
++    uint64_t pc = uc->uc_mcontext->__ss.__pc; ht_site *s = NULL; for (int i = 0; i < g_nhts; i++) if (g_hts[i].at == pc) s = &g_hts[i];
++    if (!s) return;
++    uint64_t v = uc->uc_mcontext->__ss.__x[s->reg];
++    pthread_mutex_lock(&g_ht_mu);
++    if (s->kind == 'r' && uc->uc_mcontext->__ss.__x[s->oreg]) { uint64_t o = uc->uc_mcontext->__ss.__x[s->oreg]; if (!*ht_slot(o)) ht_report("realloc of a pointer not live", o, uc); else { ht_del(o); g_ht_n--; } }
++    // 'w': remember the pointer in the register; a later free of it (or of the block holding it, when sizes are known) is printed with a backtrace
++    if (s->kind == 'w') { if (g_nwatch < 256) g_watch[g_nwatch++] = v; pthread_mutex_unlock(&g_ht_mu); return; }
++    static int rz = -1; if (rz < 0) rz = getenv("DM_HEAPTRACK_REDZONE") != NULL;
++    if (s->kind == 's') { tl_ht_size = v; if (rz && v) uc->uc_mcontext->__ss.__x[s->reg] = v + 64; pthread_mutex_unlock(&g_ht_mu); return; }
++    // 'P' at a reallocation's entry (old pointer in the site's register, new size in its second one), 'Q' at its return: a block resized in place gets its new size
++    if (s->kind == 'P') { tl_ht_rp = v; tl_ht_rs = uc->uc_mcontext->__ss.__x[s->oreg]; if (rz && tl_ht_rs) uc->uc_mcontext->__ss.__x[s->oreg] = tl_ht_rs + 64; pthread_mutex_unlock(&g_ht_mu); return; }
++    if (s->kind == 'Q') { if (v && rz && tl_ht_rs) memset((void *)(v + tl_ht_rs), 0xCB, 64); if (v && v == tl_ht_rp && g_hts_k) { uint64_t *k = hs_slot(v); if (*k) { g_hts_v[k - g_hts_k] = tl_ht_rs; uint32_t ix = g_hl_idx ? g_hl_idx[k - g_hts_k] : 0; if (ix && ix <= g_hl_n) g_hl[ix - 1].size = tl_ht_rs; } }
++                          tl_ht_rp = 0; pthread_mutex_unlock(&g_ht_mu); return; }
++    if ((s->kind == 'a' || s->kind == 'r') && v) { uint64_t *sl = ht_slot(v); if (*sl) ht_report("allocation of a live pointer", v, uc); else { *sl = v; g_ht_n++; }
++        if (g_hts_k && tl_ht_size && g_hl) {   // overlap with a live block?
++            uint64_t e = v + tl_ht_size; int shown = 0;
++            for (uint64_t i = 0; i < g_hl_n && shown < 2; i++) if (g_hl[i].p < e && v < g_hl[i].p + g_hl[i].size && g_ht_bad < 40) {
++                uint64_t *ok = hs_slot(g_hl[i].p); shown++; g_ht_bad++;
++                fprintf(stderr, "[dm] HEAPTRACK OVERLAP new %#llx+%#llx with live %#llx+%#llx; live one allocated from", (unsigned long long)v, (unsigned long long)tl_ht_size, (unsigned long long)g_hl[i].p, (unsigned long long)g_hl[i].size);
++                if (*ok) hl_lr_print(g_hts_lr[ok - g_hts_k]); fprintf(stderr, "; new one from"); dm_backtrace(uc->uc_mcontext->__ss.__fp); }
++        }
++        if (rz && tl_ht_size) memset((void *)(v + tl_ht_size), 0xCB, 64);
++        if (g_hts_k && tl_ht_size) { uint64_t *k = hs_slot(v); *k = v; g_hts_v[k - g_hts_k] = tl_ht_size;
++            if (g_hl) { g_hl[g_hl_n] = (ht_live){v, tl_ht_size}; g_hl_idx[k - g_hts_k] = (uint32_t)++g_hl_n; }
++            uint64_t *lr = g_hts_lr[k - g_hts_k]; memset(lr, 0, 32); uint64_t *fp = (uint64_t *)uc->uc_mcontext->__ss.__fp; lr[0] = uc->uc_mcontext->__ss.__lr;
++            for (int j = 1; j < 4 && fp && ((uint64_t)fp & 7) == 0 && (uint64_t)fp > 0x1000; j++) { vm_size_t g = 0; uint64_t fr[2]; if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, 16, (vm_address_t)fr, &g) || g != 16) break; lr[j] = fr[1]; fp = (uint64_t *)fr[0]; } }
++        tl_ht_size = 0; }
++    if (s->kind == 'f' && v) for (int i = 0; i < g_nwatch; i++) {
++        uint64_t sz = 0; if (g_hts_k) { uint64_t *k = hs_slot(v); if (*k) sz = g_hts_v[k - g_hts_k]; }
++        if (g_watch[i] == v || (sz && g_watch[i] > v && g_watch[i] < v + sz)) { fprintf(stderr, "[dm] HEAPTRACK watched %#llx freed (block %#llx size %#llx)", (unsigned long long)g_watch[i], (unsigned long long)v, (unsigned long long)sz); dm_backtrace(uc->uc_mcontext->__ss.__fp); g_watch[i] = 0; }
++    }
++    if (s->kind == 'f' && v && rz && g_hts_k) { uint64_t *k = hs_slot(v); uint64_t sz = *k ? g_hts_v[k - g_hts_k] : 0;
++        if (sz) { const uint8_t *c = (const uint8_t *)(v + sz); int bad = -1; for (int i = 0; i < 64; i++) if (c[i] != 0xCB) { bad = i; break; }
++            if (bad >= 0 && g_ht_bad++ < 40) { fprintf(stderr, "[dm] HEAPTRACK OVERFLOW block %#llx size %#llx written %d bytes past its end:", (unsigned long long)v, (unsigned long long)sz, bad);
++                for (int i = 0; i < 32; i++) fprintf(stderr, " %02x", c[i]); fprintf(stderr, "; allocated from"); hl_lr_print(g_hts_lr[k - g_hts_k]); fprintf(stderr, "; freed from"); dm_backtrace(uc->uc_mcontext->__ss.__fp); } } }
++    if (s->kind == 'f' && v) { if (!*ht_slot(v)) ht_report("free of a pointer not live", v, uc); else { ht_del(v); g_ht_n--; }
++        if (ht_poison() && g_hts_k && g_hl) { uint64_t *k = hs_slot(v); uint32_t ix = *k ? g_hl_idx[k - g_hts_k] : 0;
++            if (ix && ix <= g_hl_n && g_hl[ix - 1].p == v) { g_hl[ix - 1] = g_hl[--g_hl_n]; if (ix - 1 < g_hl_n) { uint64_t *m = hs_slot(g_hl[ix - 1].p); if (*m) g_hl_idx[m - g_hts_k] = ix; } g_hl_idx[k - g_hts_k] = 0; } }
++        if (ht_poison() && g_hts_k) { uint64_t *k = hs_slot(v); uint64_t sz = *k ? g_hts_v[k - g_hts_k] : 0;
++            if (sz >= 0x60) { ht_freed *f = &g_htf[g_htf_n++ % HT_NFREED]; memcpy(f->save, (void *)v, sz < sizeof f->save ? sz : sizeof f->save);
++                for (uint64_t o = 0x30; o + 0x10 + 8 <= sz; o += 8) *(uint64_t *)(v + o) = 0xF00DF00DF00DF00Dull;
++                f->p = v; f->size = sz; memset(f->lr, 0, sizeof f->lr);
++                uint64_t *fp = (uint64_t *)uc->uc_mcontext->__ss.__fp; f->lr[0] = uc->uc_mcontext->__ss.__lr;
++                for (int j = 1; j < 6 && fp && ((uint64_t)fp & 7) == 0 && (uint64_t)fp > 0x1000; j++) { vm_size_t g = 0; uint64_t fr[2]; if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, 16, (vm_address_t)fr, &g) || g != 16) break; f->lr[j] = fr[1]; fp = (uint64_t *)fr[0]; } } } }
++    pthread_mutex_unlock(&g_ht_mu);
++}
++static void heaptrack_install(void) {
++    const char *e = getenv("DM_HEAPTRACK"); if (!e) return;
++    const char *c = strchr(e, ':'); if (!c) return; char mod[16] = {0}; memcpy(mod, e, (size_t)(c - e) < 15 ? (size_t)(c - e) : 15);
++    module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, mod)) m = &g_mod[i];
++    if (!m) return;
++    g_ht = calloc(HT_CAP, sizeof *g_ht);
++    if (getenv("DM_HEAPTRACK_POISON")) { g_hts_k = calloc(HT_SCAP, 8); g_hts_v = calloc(HT_SCAP, 8); g_hts_lr = calloc(HT_SCAP, 32); g_hl = calloc(1u << 21, sizeof *g_hl); g_hl_idx = calloc(HT_SCAP, 4); }
++    for (const char *p = c + 1; *p && g_nhts < 16; ) {
++        char kind = *p++; uint64_t off = strtoull(p, (char **)&p, 16); int reg = -1, oreg = -1;
++        if (*p == '/') { p++; if (*p == 'x') p++; reg = (int)strtol(p, (char **)&p, 10); }
++        if (*p == '/') { p++; if (*p == 'x') p++; oreg = (int)strtol(p, (char **)&p, 10); }
++        g_hts[g_nhts++] = (ht_site){(uint64_t)m->base + off, kind, reg, oreg};
++        probe_add(m, off, -1, ht_hit);
++        while (*p == ',') p++;
++    }
++    LOG("DM_HEAPTRACK: %d sites", g_nhts);
++}
++#else
++void dm_heaptrack_which(const uint64_t *x, int n) { (void)x; (void)n; }
++void dm_heaptrack_rzscan(void) {}
++void dm_heaptrack_scan(void) {}
++static void heaptrack_install(void) {}
++#endif
+ void probe_install(void) {
++    heaptrack_install();
+ #if !TARGET_OS_IPHONE
+     crash_set_trap_hook(probe_hit);
+     const char *frames = getenv("DM_PROBE_FRAMES");
+diff --git a/dm/ios/tools/build_ipa.sh b/dm/ios/tools/build_ipa.sh
+index ef52be2..737fa1b 100755
+--- a/dm/ios/tools/build_ipa.sh
++++ b/dm/ios/tools/build_ipa.sh
+@@ -365,6 +365,8 @@ elif [ -n "$AOC" ] && [ -d "$AOC" ]; then
+   t "add-on content alongside the game data (DM_FULL_ROMFS=1 packs it): $(ls "$AOC" | tr '\n' ' ')"
+ fi
+ if [ -n "${PSO:-}" ]; then MAPS+=("$P/pso=$PSO"); fi
++# an NVN game that also draws with GL (Storm Connections: its Scaleform UI is GLES 3.0) takes the GL library beside the NVN chain's, from gl_shaders.py on a DM_GL_CAPTURE folder
++if [ "$MSLDIR" != gl ] && [ -f "$MSL_IOS/gl/gl_shaders.metallib" ]; then MAPS+=("$P/msl/gl=$MSL_IOS/gl"); t "GL shader library: $MSL_IOS/gl"; fi
+ MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP")
+   if [ -d "$(dirname "$ROMFS")/html" ]; then MAPS+=("$P/html=$(dirname "$ROMFS")/html"); t "offline HTML pages: $(dirname "$ROMFS")/html"; fi   # beside its RomFS, where the host finds them (hle_web.c)
+   if [ -d "$(dirname "$ROMFS")/jit" ]; then MAPS+=("$P/jit=$(dirname "$ROMFS")/jit"); t "nn::jit image: $(dirname "$ROMFS")/jit"; fi
+diff --git a/dm/tools/nx_extract/Program.cs b/dm/tools/nx_extract/Program.cs
+index b12ecec..a4724fe 100644
+--- a/dm/tools/nx_extract/Program.cs
++++ b/dm/tools/nx_extract/Program.cs
+@@ -1,6 +1,7 @@
+ // NSP extraction (a native executable, dm/tools/nx_extract_bin/nx_extract, built by dm/tools/native_tools.sh): nx_extract <prod.keys> <base NSP> <update NSP or -> <output dir> [base RomFS dir to compare against] [--manifest] [--romfs-image]
+ // --romfs-image streams the merged RomFS directly to <output dir>/RomFS.img (the packing script's default); only ExeFS is expanded. Without it, legacy folder extraction remains available.
+ // With a base RomFS dir in legacy mode, files whose content matches it become APFS clones (no new space).
++// --program N (or DM_NX_PROGRAM=N): program index N of a multi-program application instead of program 0.
+ // --manifest: the RomFS is not written, only a list <output dir>/romfs_manifest.tsv (path, size, first 32 bytes), for surveying a new game (a large game's RomFS is well over 10 GB),
+ //   and its NRO modules under <output dir>/romfs_nro/ (small: their imports decide the graphics API and the modules, Portal 2's 21 NROs are 60 MB).
+ // A damaged NSP (a file whose data fails the NCA's hash check, e.g. a copy cut short or a broken download) stops the extraction with exit code 3 after listing every damaged file;
+@@ -71,6 +72,10 @@ static class P {
+         ulong? app = null; int ai = Array.IndexOf(a, "--app");
+         if (ai >= 0 && ai + 1 < a.Length) { app = Convert.ToUInt64(a[ai + 1], 16); var rest = new List<string>(a); rest.RemoveRange(ai, 2); a = rest.ToArray(); }
+         if (a.Length >= 3 && a[1] == "--contents") return Contents(ExternalKeyReader.ReadKeyFile(a[0]), a[2..]);
++        if (a.Length == 3 && a[1] == "--title") return Title(ExternalKeyReader.ReadKeyFile(a[0]), a[2]);
++        // --program N: program index N of a multi-program application (title ID of program 0 + N) instead of program 0 (KINGDOM HEARTS -HD 1.5+2.5 ReMIX-: a menu and five games)
++        int pidx = int.TryParse(Environment.GetEnvironmentVariable("DM_NX_PROGRAM"), out int ep) ? ep : 0, pi = Array.IndexOf(a, "--program");   // DM_NX_PROGRAM: the same for the packing script's calls
++        if (pi >= 0) { pidx = int.Parse(a[pi + 1]); var l = new List<string>(a); l.RemoveRange(pi, 2); a = l.ToArray(); }
+         if (a.Length >= 3 && a[1] == "--keys") return Keys(ExternalKeyReader.ReadKeyFile(a[0]), a[2..]);
+         if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--app <title ID>] [--program=<title ID>] [--list] [--html] [--romfs-image|--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir or image> [<DLC title ID>] [--romfs-image]\n       nx_extract <prod.keys> --contents <nsp|nsz|xci|xcz>...\n       nx_extract <prod.keys> --keys <nsp|nsz|xci|xcz>..."); return 2; }
+         KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
+@@ -85,6 +90,7 @@ static class P {
+         }
+         Fit(new[] { MissingKey(ks, basePkg, a[1]), updPkg == null ? null : MissingKey(ks, updPkg, a[2]) });
+         Nca baseProg = Pick(basePkg, NcaContentType.Program, progId) ?? throw new Exception(progId == null ? "no Program NCA in the base NSP" : $"no Program NCA {progId:x16} in the base NSP");
++        if (pidx != 0) baseProg = Pick(basePkg, NcaContentType.Program, baseProg.Header.TitleId + (ulong)pidx) ?? throw new Exception($"no Program NCA of program index {pidx} in the base NSP");
+         if (html) {   // an update's NCA is read alone, or over a base game's NCA when its header marks the data section a patch (a relocation table); which base NCA it patches the
+                       // header does not say: the one it reads with passes the hash check
+             int k = 0; ulong tid = baseProg.Header.TitleId; var bases = basePkg.FindAll(n => n.Header.ContentType == NcaContentType.Manual && n.Header.TitleId == tid);
+diff --git a/scripts/build_ipa_from_nsp.py b/scripts/build_ipa_from_nsp.py
+index c29bded..1b39cfd 100755
+--- a/scripts/build_ipa_from_nsp.py
++++ b/scripts/build_ipa_from_nsp.py
+@@ -98,7 +98,7 @@ SWITCH_ALIAS = 0x1000000000             # the Switch's alias region (64 GB), whi
+ 
+ PROGRESS = 'auto'                       # stage lines on the console: 'bar' (one line per stage, redrawn in place), 'lines' (a plain line every BEAT seconds), 'off' (only each stage's start and end); 'auto' = bar in a terminal or Spyder, lines when the output goes to a file; 'json' = one JSON event per line, for a program that shows the build
+ BEAT = 30                               # seconds between progress lines in 'lines' mode
+-TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin']   # searched after the caller's PATH (tool_env): GUI apps such as Spyder do not get the shell's PATH
++TOOL_PATHS = [d for d in [os.environ.get('DOTNET_ROOT')] if d] + ['/opt/homebrew/bin', '/usr/local/bin', '/usr/local/share/dotnet', os.path.expanduser('~/.dotnet')]   # searched after the caller's PATH (tool_env): GUI apps such as Spyder do not get the shell's PATH
+ 
+ 
+ class BuildError(Exception):
+@@ -1949,13 +1949,20 @@ def decode_ue_shaders(repo, dirs, pkg_ver, patched, work, env, logs, g):
+         jd, rd, log = work / f'tmp/ue_job_{v}', work / 'tmp/ue_run', logs / f'ue_decode_{v}.log'
+         rmtree(jd); rmtree(rd)
+         for s in ('save', 'temp'): (rd / s).mkdir(parents=True)
+-        dec = None
+-        if uepak.io_shader_tocs(str(rfs.source(d))):
+-            if not host:
+-                PROG.set(step='building the Mac host')
+-                host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
+-            dec = uepak.OodleHost(host, patched, env)
+-        PROG.set(step=f'{v}: shader archives out of the paks' + (' and IoStore containers' if dec else ''))
++        class LazyOodle:   # the game's Oodle in the host's tool mode, started on the first call: IoStore shader libraries (UE 5.6) and inline shader maps (UE 4.27 without archives) need it
++            o = None
++            def __call__(self, comp, raw):
++                nonlocal host
++                if not self.o:
++                    if not host:
++                        PROG.set(step='building the Mac host')
++                        host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
++                    PROG.set(step=f'{v}: shaders out of the paks and IoStore containers'); self.o = uepak.OodleHost(host, patched, env)
++                return self.o(comp, raw)
++            def close(self):
++                if self.o: self.o.close()
++        dec = LazyOodle()
++        PROG.set(step=f'{v}: shader archives out of the paks')
+         try: listing, n = uepak.job(str(rfs.source(d)), str(d / 'ExeFS/main'), str(jd), decode=dec)
+         except ValueError as e: raise BuildError(str(e)) from e   # a damaged pak, archive or main (uepak's errors name it)
+         finally:
+@@ -1976,7 +1983,7 @@ def decode_ue_shaders(repo, dirs, pkg_ver, patched, work, env, logs, g):
+                 raise BuildError(f'the Oodle decode run stopped with exit {rc} (host output: {log})')
+         out = d / 'ue_shaders.partial'; rmtree(out)
+         uepak.finish(str(jd), str(out)); (out / 'stamp').write_text(ue_stamp(d))
+-        swap_in(out, d / 'ue_shaders'); rmtree(jd); rmtree(rd); total += n + sum(x['shaders'] for x in listing if x['compression'] == 'IoStore, decoded')
++        swap_in(out, d / 'ue_shaders'); rmtree(jd); rmtree(rd); total += n + sum(x['shaders'] for x in listing if x['compression'] in ('IoStore, decoded', 'inline, decoded'))
+     PROG.end(f'{total:,} shaders in {hms(time.time() - t0)}')
+ 
+ 

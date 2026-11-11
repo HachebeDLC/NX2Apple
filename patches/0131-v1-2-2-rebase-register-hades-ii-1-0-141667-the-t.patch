@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20G=C3=B3mez?=
+ <26456472+HachebeDLC@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 13:54:22 +0100
+Subject: [PATCH] v1.2.2 rebase: register Hades II 1.0.141667, the two-call
+ GMalloc test, new switches documented
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Hades II's patches.py names the 1.0.141667 update's main (a862861f…), which the
+profile now registers as a build (test_patches checks every named build). The
+ue_malloc finder returns its calls as a list and accepts the two close
+setups of DRAGON BALL Sparking! ZERO, so its tests expect that; three calls
+stay red. docs/env_switches.tsv gets meanings for the switches the iOS ports
+read, and docs/agents/game-patches.md is regenerated.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DdPiRBdo6BGoU2TSvWZ4sW
+
+Upstream-Status: pending
+Reason: keeps the iOS ports (patches 0084-0090) consistent with the v1.2.2 engine: the Hades II build our patches name, the ue_malloc two-call rule, the switches they read
+Issue: HachebeDLC/NX2Apple#1
+---
+ docs/env_switches.tsv | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+index 1d325f0..38b4a32 100644
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -22,6 +22,9 @@ DM_CHEATS_ON	switch	Comma-separated cheat names turned on at launch, besides the
+ DM_CHEATS_WINDOW	switch	`1` opens the Mac Cheats panel beside the game from the start
+ DM_COPY_GAME_RESOURCES	switch	`NO` skips the Xcode build phase that copies the game's resources into the app (`stage_resources.sh`, on by default); `build_ipa.sh` sets it for its unsigned build, which packs them itself
+ DM_COPY_ROMFS	switch	`NO` keeps the game files out of the app, in the Xcode build phase (`stage_resources.sh`) and in the unsigned IPA of `build_ipa.sh` (on by default): `main.m` takes the validated `Documents/romfs.img` copied by `scripts/push_romfs.sh`, then a `Documents/romfs` folder; the build writes the image's identity as `romfs.id` into the app, and `main.m` uses only a matching image (`--romfs separate` of the NSP script sets this)
++DM_CORELOCK	diagnostic	`=1` (or a comma-separated list of thread names) makes guest threads take a per-core lock, so only one guest thread runs on each emulated core at a time (diagnosing races that depend on the Switch's core count)
++DM_CORELOCK_GLOBAL	diagnostic	with DM_CORELOCK, one lock for every core: one guest thread runs at a time
++DM_CRASH_AROUND	diagnostic	on a crash, the log shows 0x200 bytes on each side of the guest-heap addresses the registers hold (what overwrote a heap block)
+ DM_CTL	diagnostic	`=<file>` (Mac): the host polls the file every 100 ms and runs each appended line: button presses, `shot`, `passdump`, `texdump`, `env KEY=VALUE`, `peek`, `memdump`, `drag` and more
+ DM_CTRL_PROMPT_TEXT	switch	The texts of the controller applet's prompt (a game wants more players than have joined; `ctrl_prompt.h`) in the player's language, one per line: the title, the hint, the count, the done and the cancel button, with `{min}`, `{max}` and `{joined}` replaced by the numbers; a front end sets it ([Starting a game](frontends.md#starting-a-game)), an empty or missing line keeps the English text
+ DM_CURSOR_HIDDEN	player	`=1` (Mac) starts the game with the pointer already hidden, as the launcher sets it when its console had hidden the pointer, so it does not show up for a moment between the two windows. The usual rule of `DM_CURSOR_HIDE` takes over once the pointer is over the game window
+@@ -30,6 +33,7 @@ DM_DBG	diagnostic	When set, prints the guest's `svcOutputDebugString` text to st
+ DM_DBG_AU_FRAMES	diagnostic	`=<frames>` asks the Mac's Core Audio output for that many frames per callback instead of about 5 ms (1024 reproduces the iOS default that caused crackling)
+ DM_DETCLOCK	switch	`=<step ns>`: from the first present on, the guest clock advances a fixed step per present instead of following the wall clock, and the random source becomes a fixed-seed stream (replay and test runs)
+ DM_DETCLOCK_PACE	switch	`=1` with `DM_DETCLOCK`: each frame takes at least one clock step of wall time, so background loading keeps up with the fixed clock (used by the screenshot gate)
++DM_DISPLAY_HEIGHT	player	the output size row the host picks from the game's display mode table (`720`, `900`, `1080`; 0 = the game's own), over the profile's `display_height` (NARUTO X BORUTO Storm Connections; launcher's Resolution)
+ DM_DISPLAY_NAME	switch	Overrides the iOS app's name in `build_ipa.sh` (default the game name in the base NSP's control data)
+ DM_DYNAMIC_RESOLUTION	player	`1` lets the game's own dynamic resolution run, `0` (default) keeps full resolution; only on the builds that declare the DYNAMIC_RESOLUTION capability: NieR:Automata 1.0.3 (its patches.py; scales between 70 and 100 %, `hle_fpslock.c` `k_nier_dr`) and Ocarina of Time (its frame step stub of the level function, state page +0x40: on, it steps one level at a time on the measured load, as the game's own extrapolation from pixel count kept it at its lowest level on Apple GPUs). The launcher's Dynamic resolution
+ DM_EMBED_TAG	path	Set by the iOS app of a game of several programs: the tag of the running program's embedded sections (`p<N>`, `gen_embed.py --tag`)
+@@ -68,6 +72,8 @@ DM_GL_DRAWLOG	diagnostic	`=<n>[:<seconds>]` logs the first `<n>` GL draws after
+ DM_GL_FBLOG	diagnostic	`=1` logs every framebuffer bind with its size and the draws so far
+ DM_GL_LOG	diagnostic	`=1` makes the GL layer log object creation
+ DM_GL_MISSES	diagnostic	`=1` reports each `eglGetProcAddress` name the layer lacks when the game first asks for it
++DM_GL_NOCTX	diagnostic	eglCreateContext fails, as on a system without GLES (does the game need its GL layer)
++DM_GL_NOOP	diagnostic	a GL function the host does not implement does nothing instead of being null; `=log` also logs its first call
+ DM_GL_STUBS	diagnostic	`=1` gives every GL function the layer lacks a stub that reports its first call and returns 0, instead of a null pointer (bring-up)
+ DM_GPU_CAPTURE	diagnostic	`=<frame>[:<frames>]` or `gpu:<ms>[:<after frame>]` writes a Metal GPU trace of those frames for Xcode's Metal debugger; can be set while running through `DM_CTL`
+ DM_GPU_CAPTURE_DIR	path	Folder for `DM_GPU_CAPTURE`'s traces (default `gpu_captures/` in the working directory)
+@@ -79,6 +85,9 @@ DM_GUEST_FILE_MIN_FREE	switch	`=<size>` (whole MB, K / M / G; default 2G, `0` ne
+ DM_GUEST_FILE_PUNCH	switch	`0` keeps the disk blocks of guest memory the game gives back (with `DM_GUEST_FILE=1`); by default they are punched out (`F_PUNCHHOLE`, which also drops the pages): the heap's at once, the alias region's by a sweep every 10 s once they have stayed given back over a whole interval
+ DM_GUEST_FILE_SCAN	diagnostic	`=1` (with `DM_GUEST_FILE=1`): every 30 s a `[mem] guest file scan` line, the dirty guest pages by region (heap, alias, stack, other) and how many of them read all 0
+ DM_GUEST_SPAWN_TEST	diagnostic	`=1` runs a self-test before `nnMain`: a host-started guest thread does SDK malloc / free and locks an `nn::os` mutex, and the result is logged; `=2` also keeps a resident thread
++DM_HEAPTRACK	diagnostic	tracks the guest heap's allocations and frees (probe.c) to find what overwrites or frees a block twice
++DM_HEAPTRACK_POISON	diagnostic	with DM_HEAPTRACK, freed blocks are filled with a pattern and checked when reused
++DM_HEAPTRACK_REDZONE	diagnostic	with DM_HEAPTRACK_POISON, the bytes past each block are checked for writes beyond its end
+ DM_HID_LOG	diagnostic	`1` logs the HID button usage number of each button pressed on a raw HID gamepad (`pad_hid_mac.h`), to write a `DM_HID_MAP`
+ DM_HID_MAP	switch	`=<map>` such as `A=1,B=2,X=4,Y=5`: which HID button usage presses each Switch button on a raw HID gamepad (names A B X Y LS RS L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN; default 8BitDo's D-input numbering by position, `pad_hid.h`); Mac only
+ DM_HID_PADS	switch	`0` stops reading raw HID gamepads that GameController does not list, such as an 8BitDo in its own mode (`pad_hid_mac.h`); Mac only
+@@ -281,6 +290,7 @@ DM_PROBE	diagnostic	`=module:offset,…` (Mac only): puts a `brk` at each guest
+ DM_PROBE_ALL	diagnostic	Set: probe hits (`DM_PROBE`) also print x8–x18
+ DM_PROBE_DUMP	diagnostic	`=module:offset:length[:file]`: on the first hit of any probe, writes that range of guest memory to a file (default `run/<platform>/probe_dump.bin`)
+ DM_PROBE_EVERY	diagnostic	`=N`: every guest probe hit inside `DM_PROBE_FRAMES` counts, every N-th prints (its `#` is then the true hit count, for rates); `DM_PROBE_LIMIT` caps the printed ones
++DM_PROBE_DUMPTXT	diagnostic	with DM_PROBE, each pointer in the dump also shows the 96 bytes it points at as text
+ DM_PROBE_FRAMES	diagnostic	Presented frame or inclusive `start-end` range in which guest probes print observations
+ DM_PROBE_HEAP	diagnostic	`=<name>,<start>,<size>,<free list>,<used list>`: hex offsets of the sead heap layout the probes' `!xN` heap walk uses (default Mario's `0,28,30,b0,c8`)
+ DM_PROBE_HEAPFRAME	diagnostic	`=<vtable offset in main>` (hex): the probes' heap walk treats heaps of that class as frame heaps (head +0xe0, tail +0xe8)
+@@ -350,6 +360,7 @@ DM_SCREEN_ASPECT_SITES	diagnostic	`=<mask>` with DM_SCREEN_ASPECT: which of the
+ DM_SCREEN_FOV	diagnostic	`off` with DM_SCREEN_ASPECT: the scene keeps the game's vertical angle (narrower sides) instead of 16:9's sides with more above and below
+ DM_SCREEN_HUD	diagnostic	`=<edge>,<listed>,<full width>,<full height>[,<tallest>]` with DM_SCREEN_ASPECT: the layout rules' distances and sizes in the 1280x720 space (default 280,100,1270,710,1300)
+ DM_SCREEN_MATCH	switch	`0` keeps the screen's refresh rate in fullscreen; by default a Mac screen whose rate is not a multiple of the game's frame rate switches to one that is (144 → 120 Hz), and a variable-refresh screen to a fixed-rate mode at a multiple (ProMotion 120 → 60 Hz at 60 and 30 fps)
++DM_SCREEN_PERCENTAGE	player	Unreal r.ScreenPercentage the host sets over the device profile's (`25` to `200`; 0 = the game's own), over the profile's `screen_percentage` (DRAGON BALL Sparking! ZERO; launcher's Internal resolution)
+ DM_SF_TRACE	diagnostic	`=1` logs every request on the game's own HIPC client sessions that the host answers (`hle_sf.c`)
+ DM_SHADER_FILES	switch	`1` packs an NVN game's shader library into the unsigned IPA of `build_ipa.sh` as its separate files, `msl/b-<chain>/`, not as the one file `b-<chain>.img`, for install tools that cannot copy a large file (AltServer: 2 GiB) (`pack_ipa.py --shader-files`; off by default; `--shader-files` of the NSP script sets this)
+ DM_SHAKE_G	switch	`=<G>`: on iOS, the acceleration beyond gravity above which a flick of the phone shakes the controller's six-axis sensor (default 1.5)
+@@ -403,6 +414,7 @@ DM_TEST_UP_LOST	diagnostic	`=<batch index>` treats that batch of uploads as drop
+ DM_THERMAL_CAP	switch	`0` turns off the thermal cap, which holds the frame step at 30 fps while iOS reports a serious or critical thermal state (on by default)
+ DM_THR	diagnostic	`=1` logs each SVC (except `SleepThread`) with its first four arguments, and each `CreateThread` with entry, stack, priority and core
+ DM_THRCPU	diagnostic	`=<tsv path>[,<seconds>]` writes each thread's CPU time (100% = one core) and the total every interval (default 10 s); on iOS a relative path is under `Documents`
++DM_TLS_CHECK	diagnostic	at every SVC, compares the guest thread pointers (tpidr_el0, tpidrro_el0) with the other threads' and logs a [RED] line when two live threads share one
+ DM_TOUCH_HAPTICS	player	`0` turns off the light haptic tap when a touch control is pressed (on by default); launcher setting
+ DM_TOUCH_HINT	player	Localized words for the iOS right-stick hint, shown once per launch when the 3D layout has room and no controller is connected. Empty disables the hint
+ DM_TOUCH_LAYOUT	player	The player's per-layout touch-control arrangement, encoded by the shell's touch layout editor. Invalid values keep the built-in positions
+@@ -414,6 +426,7 @@ DM_UDC_SELFTEST	diagnostic	`=1` runs a start-up check of DontCare load and store
+ DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.py`, for `shader_split.py` (default `ue_shaders` beside the RomFS); needed when the RomFS has Unreal paks
+ DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (`r.Streaming.PoolSize`) is raised to, overriding the profile's `ue_texture_pool`; `0` keeps the game's own pool. On iOS only this switch turns it on (`Documents/env.txt`)
+ DM_UI_HOLD	test	When set, keeps the controller mapping test window open for 60 seconds after its UI screenshot for manual inspection
++DM_UNMAP_NOCOPY	diagnostic	UnmapMemory does not copy the mapped range back to its source (whether a game relies on that copy)
+ DM_UPSCALER	player	`metalfx` draws the game's own upscaler shaders (agl's NDSR network, found by the shader map) with MetalFX's spatial scaler; `game` (the default) runs them
+ DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
+ DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer

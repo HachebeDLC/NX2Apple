@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20G=C3=B3mez?=
+ <26456472+HachebeDLC@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:07:26 +0100
+Subject: [PATCH] v1.4.0 rebase: generated indexes (game-patches.md,
+ env_switches.tsv)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: the v1.4.0 rebase of the iOS ports (patches 0124-0131) leaves the generated patch index and switch table to bring up to date
+Issue: HachebeDLC/NX2Apple#1
+
+---
+ docs/env_switches.tsv | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+index 38b4a32..04d70cc 100644
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -289,8 +289,8 @@ DM_PREV_PROGRAM	switch	What `oe::GetPreviousProgramIndex` answers (default -1, s
+ DM_PROBE	diagnostic	`=module:offset,…` (Mac only): puts a `brk` at each guest address and on every hit prints the thread, registers, strings they point to and a backtrace, then runs the original instruction
+ DM_PROBE_ALL	diagnostic	Set: probe hits (`DM_PROBE`) also print x8–x18
+ DM_PROBE_DUMP	diagnostic	`=module:offset:length[:file]`: on the first hit of any probe, writes that range of guest memory to a file (default `run/<platform>/probe_dump.bin`)
+-DM_PROBE_EVERY	diagnostic	`=N`: every guest probe hit inside `DM_PROBE_FRAMES` counts, every N-th prints (its `#` is then the true hit count, for rates); `DM_PROBE_LIMIT` caps the printed ones
+ DM_PROBE_DUMPTXT	diagnostic	with DM_PROBE, each pointer in the dump also shows the 96 bytes it points at as text
++DM_PROBE_EVERY	diagnostic	`=N`: every guest probe hit inside `DM_PROBE_FRAMES` counts, every N-th prints (its `#` is then the true hit count, for rates); `DM_PROBE_LIMIT` caps the printed ones
+ DM_PROBE_FRAMES	diagnostic	Presented frame or inclusive `start-end` range in which guest probes print observations
+ DM_PROBE_HEAP	diagnostic	`=<name>,<start>,<size>,<free list>,<used list>`: hex offsets of the sead heap layout the probes' `!xN` heap walk uses (default Mario's `0,28,30,b0,c8`)
+ DM_PROBE_HEAPFRAME	diagnostic	`=<vtable offset in main>` (hex): the probes' heap walk treats heaps of that class as frame heaps (head +0xe0, tail +0xe8)

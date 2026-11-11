@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20Go=CC=81mez?=
+ <26456472+HachebeDLC@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 07:24:26 +0100
+Subject: [PATCH] ue_malloc: find the allocator in mains with no unwind entries
+ here, and the duplicated GMalloc setup
+
+The finder gave up when the candidate function start and the vtable store had a
+RET between them (DRAGON BALL Sparking! ZERO 2.0.73: 34.68 MB analysed in 146
+pieces, no unwind entries over the store). It now falls back to the instruction
+block after the last RET before the store; the single-store and call-count
+checks still select the constructor. Its constructor can also have two call
+sites (the two GCreateMalloc copies 0x518 apart): both are cut, and the host's
+OBS_UE_MALLOC gate takes the object from the first that runs.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: the finder gave up on DRAGON BALL Sparking! ZERO's main (no unwind entries over the vtable store), its allocator ran uncut and the game crashed on its first 256 KB Malloc; also cuts both call sites of the duplicated GMalloc setup
+Issue: HachebeDLC/NX2Apple#1
+---
+ dm/tools/ue_malloc.py | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/dm/tools/ue_malloc.py b/dm/tools/ue_malloc.py
+index eb5dc89..0e90b86 100644
+--- a/dm/tools/ue_malloc.py
++++ b/dm/tools/ue_malloc.py
+@@ -89,7 +89,13 @@ def find(img, text_end, ro_off, data_off):
+         if not any(is_adrp(word(p), n) and adrp_page(word(p), p) == vt & ~0xFFF for p in range(max(0, a - 32), a, 4)): continue
+         if not any((word(q) & 0xFFFFFC1F) == 0xF9000000 | d for q in range(a + 4, min(text_end, a + 48), 4)): continue   # str xD, [xM]
+         start = max((t for t in list(bl) + list(b) + list(dtors) if t <= a), default=None)
+-        if start is None or any(word(q) == RET for q in range(start, a, 4)): return None, None, None, f'[RED] FMallocBinned3 vtable at {vt:#x}: no function start for its store at {a:#x}'
++        # A main with no unwind entries in this range names no start here (DRAGON BALL Sparking! ZERO 2.0.73: 34.68 MB in 146 pieces, a RET between the
++        # candidate start and the store). The store still has exactly one caller when it is a constructor's vtable store: fall back to the instruction
++        # block after the last RET before the store, and let the one-call check below reject a store that is not one.
++        if start is None or any(word(q) == RET for q in range(start, a, 4)):
++            r = max((q for q in range(max(0, start or 0), a, 4) if word(q) == RET), default=None)
++            if r is None: return None, None, None, f'[RED] FMallocBinned3 vtable at {vt:#x}: no function start for its store at {a:#x}'
++            start = r + 4
+         if start not in dtors: ctors.add(start)
+     if len(ctors) != 1: return None, None, None, f'[RED] FMallocBinned3 vtable at {vt:#x}: {len(ctors)} constructors (' + ', '.join(f'{x:#x}' for x in sorted(ctors)) + ')'
+     c = ctors.pop()

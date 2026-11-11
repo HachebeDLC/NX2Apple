@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Daniel=20G=C3=B3mez?=
+ <26456472+HachebeDLC@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:09:51 +0100
+Subject: [PATCH] crash.c: weak no-op heap tracker calls where crash.c is
+ linked without probe.c (the gfx tests)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Upstream-Status: pending
+Reason: patch 0124's crash handler calls probe.c's heap tracker, which the gfx tests do not link: weak no-ops keep them linking
+Issue: HachebeDLC/NX2Apple#1
+
+---
+ dm/host/crash.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/crash.c b/dm/host/crash.c
+index ff66998..f2d1457 100644
+--- a/dm/host/crash.c
++++ b/dm/host/crash.c
+@@ -16,6 +16,10 @@
+ #include <fcntl.h>
+ #include <spawn.h>
+ #include <sys/wait.h>
++// probe.c's heap tracker; these weak no-ops stand in where crash.c is linked without probe.c (tools and tests)
++__attribute__((weak)) void dm_heaptrack_which(const uint64_t *x, int n) { (void)x; (void)n; }
++__attribute__((weak)) void dm_heaptrack_scan(void) {}
++__attribute__((weak)) void dm_heaptrack_rzscan(void) {}
+ #endif
+ 
+ static _Atomic uint64_t g_watch_last_ns;
+@@ -202,7 +206,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
+             fputc('\n', stderr);
+         }
+     }
+-    { extern void dm_heaptrack_scan(void); extern void dm_heaptrack_which(const uint64_t *, int); dm_heaptrack_which((const uint64_t *)uc->uc_mcontext->__ss.__x, 29); dm_heaptrack_scan(); extern void dm_heaptrack_rzscan(void); dm_heaptrack_rzscan(); }
++    dm_heaptrack_which((const uint64_t *)uc->uc_mcontext->__ss.__x, 29); dm_heaptrack_scan(); dm_heaptrack_rzscan();   // probe.c's heap tracker (weak no-ops below without it)
+     dm_backtrace(uc->uc_mcontext->__ss.__fp);
+     // Stack scan: when the frame chain is broken (a return address was overwritten, pc = lr lands on garbage) the backtrace prints nothing; scan 512 words up from sp and list everything that resolves to a module / host symbol (nearest callers first)
+     {   uint64_t sp = uc->uc_mcontext->__ss.__sp;   // The frame just popped (when a return address was overwritten, the bad value and the leftovers of whatever overwrote it sit below sp)
